@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+  emulatorjs-sfu:
+    build:
+      context: .
+    container_name: emulatorjs-sfu
+    restart: unless-stopped
+    environment:
+      # --- Minimal required config ---
+      # Must match RomM's ROMM_AUTH_SECRET_KEY.
+      - ROMM_AUTH_SECRET_KEY=${ROMM_AUTH_SECRET_KEY:?set ROMM_AUTH_SECRET_KEY}
+
+      # Auth Redis (recommended: parts so special characters are safe)
+      - SFU_AUTH_REDIS_HOST=${SFU_AUTH_REDIS_HOST:-romm-valkey}
+      - SFU_AUTH_REDIS_PORT=${SFU_AUTH_REDIS_PORT:-6379}
+      - SFU_AUTH_REDIS_DB=${SFU_AUTH_REDIS_DB:-0}
+      # Preferred: set VALKEY_SFU_PASSWORD (SFU auth Redis user password).
+      # Backwards-compatible: SFU_AUTH_REDIS_PASSWORD is still supported.
+      - VALKEY_SFU_PASSWORD=${VALKEY_SFU_PASSWORD:?set VALKEY_SFU_PASSWORD}
+      # Optional: override ACL username (defaults to 'sfu' when VALKEY_SFU_PASSWORD is used)
+      # - SFU_AUTH_REDIS_USERNAME=sfu
+
+      # --- Common optional overrides (safe defaults in code) ---
+      # Signaling port (default 3001). Keep the published ports in sync below.
+      - PORT=${PORT:-3001}
+      # WebRTC media port (default 20000). Keep the published ports in sync below.
+      - WEBRTC_PORT=${WEBRTC_PORT:-20000}
+
+      # ANNOUNCED_IP guidance:
+      # - Public internet / behind NAT: set this to the public IP/hostname clients use.
+      # - LAN-only: usually safe to omit.
+      # - ANNOUNCED_IP=${ANNOUNCED_IP}
+
+      # STUN servers for clients (STUN-only; TURN is intentionally not supported)
+      # Comma or space separated; you can omit the "stun:" prefix.
+      # - SFU_STUN_SERVERS=${SFU_STUN_SERVERS}
+
+      # Optional hardening: disable to enforce strict single connection per userid.
+      # - SFU_ALLOW_AUTH_TAKEOVER=0
+      # Optional: takeover grace window (seconds). Default is 30.
+      # - SFU_AUTH_TAKEOVER_GRACE_SECONDS=30
+
+      # Advanced: override defaults (only if you know why)
+      # - USE_WEBRTC_SERVER=1
+      # - LISTEN_IP=0.0.0.0
+      # - ENABLE_WEBRTC_TCP=1
+      # - WEBRTC_UDP_PORT=${WEBRTC_UDP_PORT}
+      # - WEBRTC_TCP_PORT=${WEBRTC_TCP_PORT}
+      # Alternative (URL form): requires percent-encoding of special chars
+      # - SFU_AUTH_REDIS_URL=${SFU_AUTH_REDIS_URL}
+
+    ports:
+      - "${PORT:-3001}:${PORT:-3001}/tcp"
+      - "${WEBRTC_PORT:-20000}:${WEBRTC_PORT:-20000}/udp"
+      - "${WEBRTC_PORT:-20000}:${WEBRTC_PORT:-20000}/tcp"
+
+    # If Valkey is in the same compose project/network, use the service name above.
+    # Otherwise, change SFU_AUTH_REDIS_HOST to the correct hostname/IP.

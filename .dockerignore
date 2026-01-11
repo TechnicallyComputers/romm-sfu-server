@@ -1,0 +1,17 @@
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+sfu.log
+
+.git
+.gitignore
+Dockerfile
+
+docker-compose*.yml
+
+# Local artifacts / scripts
+test-client.js
+puppeteer-owner.js

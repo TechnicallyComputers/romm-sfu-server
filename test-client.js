@@ -1,10 +1,14 @@
 const io = require("socket.io-client");
 
 const SERVER = process.env.SFU_SERVER || "http://localhost:3001";
+const SFU_TOKEN = process.env.SFU_TOKEN || null;
 
 async function main() {
   console.log("Connecting to", SERVER);
-  const socket = io(SERVER, { reconnection: false });
+  const socket = io(SERVER, {
+    reconnection: false,
+    auth: SFU_TOKEN ? { token: SFU_TOKEN } : undefined,
+  });
 
   socket.on("connect", async () => {
     console.log("connected, id=", socket.id);
