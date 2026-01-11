@@ -31,6 +31,21 @@ const logger = {
 // Extremely chatty RTP/stat logs are disabled by default.
 const SFU_DEBUG_STATS = process.env.SFU_DEBUG_STATS === "1";
 
+// Data channel policy: RomM netplay uses binary payloads only.
+// If enabled, any dataProducer that sends text/non-binary payloads will be closed.
+const SFU_REQUIRE_BINARY_DATA_CHANNEL =
+  process.env.SFU_REQUIRE_BINARY_DATA_CHANNEL !== "0";
+
+// Optional: Validate client RTP layering policy (does not modify sender behavior).
+// These guards are useful to catch older clients that still publish 3-layer simulcast
+// or VP9 without the expected SVC mode.
+const SFU_EXPECT_VP9_SVC_MODE = process.env.SFU_EXPECT_VP9_SVC_MODE
+  ? String(process.env.SFU_EXPECT_VP9_SVC_MODE).toUpperCase()
+  : null;
+const SFU_ENFORCE_VP9_SVC_MODE = process.env.SFU_ENFORCE_VP9_SVC_MODE === "1";
+const SFU_ENFORCE_2_LAYER_SIMULCAST =
+  process.env.SFU_ENFORCE_2_LAYER_SIMULCAST === "1";
+
 // mediasoup WebRtcServer support
 // If enabled, all WebRTC transports share the same UDP (and optionally TCP) listening port(s),
 // which simplifies firewall/NAT rules compared to allocating a port per transport.
@@ -55,6 +70,111 @@ const WEBRTC_TCP_PORT = Number.parseInt(
 // If you want to fully constrain worker usage, set RTC_MIN_PORT and RTC_MAX_PORT accordingly.
 const RTC_MIN_PORT = Number.parseInt(process.env.RTC_MIN_PORT || "20000", 10);
 const RTC_MAX_PORT = Number.parseInt(process.env.RTC_MAX_PORT || "20200", 10);
+
+function getPrimaryVideoCodecMimeType(rtpParameters) {
+  try {
+    const codecs = (rtpParameters && rtpParameters.codecs) || [];
+    for (const c of codecs) {
+      const mt = c && typeof c.mimeType === "string" ? c.mimeType : "";
+      const lower = mt.toLowerCase();
+      if (!lower.startsWith("video/")) continue;
+      if (lower === "video/rtx") continue;
+      return lower;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function summarizeEncodings(rtpParameters) {
+  try {
+    const enc = (rtpParameters && rtpParameters.encodings) || [];
+    return enc.map((e) => ({
+      rid: e && e.rid,
+      ssrc: e && e.ssrc,
+      scalabilityMode: e && e.scalabilityMode,
+      scaleResolutionDownBy: e && e.scaleResolutionDownBy,
+      maxBitrate: e && e.maxBitrate,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+function validateVideoRtpLayerPolicy({ socketId, rtpParameters }) {
+  // Default behavior: do nothing. This SFU is client-driven; the host decides.
+  // Enable checks only when explicitly configured (useful for mixed-client deployments).
+  if (
+    !SFU_EXPECT_VP9_SVC_MODE &&
+    !SFU_ENFORCE_VP9_SVC_MODE &&
+    !SFU_ENFORCE_2_LAYER_SIMULCAST
+  ) {
+    return;
+  }
+
+  const mime = getPrimaryVideoCodecMimeType(rtpParameters);
+  if (!mime) return;
+
+  const encodings = (rtpParameters && rtpParameters.encodings) || [];
+  const encodingCount = Array.isArray(encodings) ? encodings.length : 0;
+
+  // VP9 SVC is typically published as a single encoding with scalabilityMode.
+  if (mime === "video/vp9") {
+    const svcModeRaw =
+      encodingCount > 0 && encodings[0] && encodings[0].scalabilityMode
+        ? String(encodings[0].scalabilityMode)
+        : "";
+    const svcMode = svcModeRaw.toUpperCase();
+
+    // If it looks like SVC (scalabilityMode present), validate it.
+    if (svcMode) {
+      if (SFU_EXPECT_VP9_SVC_MODE && svcMode !== SFU_EXPECT_VP9_SVC_MODE) {
+        const msg = `VP9 SVC mode mismatch: got ${
+          svcModeRaw || "(empty)"
+        }, expected ${SFU_EXPECT_VP9_SVC_MODE}`;
+        if (SFU_ENFORCE_VP9_SVC_MODE) throw new Error(msg);
+        logger.warn("sfu-produce: " + msg, { socket: socketId });
+      }
+      return;
+    }
+
+    // VP9 without scalabilityMode is valid (VP9 simulcast or non-SVC).
+    // Only error in strict mode when an explicit expected mode is configured.
+    if (SFU_ENFORCE_VP9_SVC_MODE && SFU_EXPECT_VP9_SVC_MODE) {
+      throw new Error(
+        `VP9 without scalabilityMode (expected ${SFU_EXPECT_VP9_SVC_MODE})`
+      );
+    }
+    // Continue into simulcast checks below (if enabled).
+  }
+
+  // Simulcast is typically multiple encodings.
+  if (encodingCount > 1) {
+    if (encodingCount !== 2) {
+      const msg = `simulcast encoding count ${encodingCount} (expected 2)`;
+      if (SFU_ENFORCE_2_LAYER_SIMULCAST) throw new Error(msg);
+      logger.warn("sfu-produce: " + msg, { socket: socketId, mime });
+    }
+  }
+}
+
+function isBinaryDataChannelMessage(message, ppid) {
+  // WebRTC PPIDs commonly used:
+  // - 51: string
+  // - 53: binary
+  // - 50/54: empty string/binary
+  // mediasoup provides `ppid` for SCTP messages.
+  if (ppid === 51 || ppid === 50) return false;
+  if (typeof message === "string") return false;
+
+  // mediasoup typically provides a Buffer for binary messages.
+  if (Buffer.isBuffer(message)) return true;
+  if (message instanceof ArrayBuffer) return true;
+  if (ArrayBuffer.isView(message)) return true;
+
+  return false;
+}
 
 function parseStunIceServersFromEnv() {
   const raw = (
@@ -1097,6 +1217,10 @@ io.on("connection", (socket) => {
       const transport = peers.get(socket.id).transports.get(transportId);
       if (!transport) throw new Error("transport not found");
 
+      if (kind === "video") {
+        validateVideoRtpLayerPolicy({ socketId: socket.id, rtpParameters });
+      }
+
       // IMPORTANT: We do not currently have explicit client->server signaling
       // to close old producers when the client calls producer.close().
       // If the host re-produces (e.g. after pause/resume), the SFU can end up
@@ -1183,6 +1307,7 @@ io.on("connection", (socket) => {
               payloadType: c.payloadType,
             })),
           encodings: rtpParameters.encodings && rtpParameters.encodings.length,
+          encodingsSummary: summarizeEncodings(rtpParameters),
         });
       } catch (e) {
         logger.warn("failed to summarize producer rtpParameters", e);
@@ -1317,6 +1442,31 @@ io.on("connection", (socket) => {
         });
 
         peer.dataProducers.set(dataProducer.id, dataProducer);
+
+        if (SFU_REQUIRE_BINARY_DATA_CHANNEL) {
+          dataProducer.on("message", (message, ppid) => {
+            try {
+              if (isBinaryDataChannelMessage(message, ppid)) return;
+
+              logger.warn("dataProducer sent non-binary message; closing", {
+                socket: socket.id,
+                dataProducerId: dataProducer.id,
+                label: dataProducer.label,
+                protocol: dataProducer.protocol,
+                ppid,
+                messageType: typeof message,
+              });
+
+              try {
+                dataProducer.close();
+              } catch {
+                // ignore
+              }
+            } catch (e) {
+              logger.warn("failed to enforce binary-only data channel", e);
+            }
+          });
+        }
 
         dataProducer.on("transportclose", () => {
           try {

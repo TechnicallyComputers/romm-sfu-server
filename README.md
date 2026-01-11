@@ -47,6 +47,21 @@ listening port. This lets you open a single UDP port in your firewall/NAT instea
 - `WEBRTC_TCP_PORT` (optional): override TCP port (defaults to `WEBRTC_PORT`).
 - `RTC_MIN_PORT` / `RTC_MAX_PORT` (defaults `20000` / `20200`): mediasoup worker RTC port range. Not relevent when using WebRtcServer
 
+### Optional policy guards
+
+These are intentionally **opt-in**: the SFU is client-driven and does not force what the host sends.
+They exist to help operators detect/deny unexpected client behavior in mixed-client deployments.
+
+- `SFU_EXPECT_VP9_SVC_MODE` (optional): if set, compare VP9 `scalabilityMode` against this value (example: `L2T3`).
+- `SFU_ENFORCE_VP9_SVC_MODE` (default `0`): set to `1` to reject VP9 producers whose `scalabilityMode` doesn't match `SFU_EXPECT_VP9_SVC_MODE`.
+- `SFU_ENFORCE_2_LAYER_SIMULCAST` (default `0`): set to `1` to reject simulcast producers that publish anything other than 2 encodings.
+
+### Data channel payloads
+
+RomM netplay data channels are expected to be binary only.
+
+- `SFU_REQUIRE_BINARY_DATA_CHANNEL` (default `1`): set to `0` to allow text messages over data channels. When enabled, any dataProducer that sends a text/non-binary payload is immediately closed.
+
 ## Multi-node / scaling
 
 This server can run as multiple SFU nodes (horizontal scaling) using a Redis-backed

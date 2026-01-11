@@ -41,6 +41,20 @@ services:
       # Optional: takeover grace window (seconds). Default is 30.
       # - SFU_AUTH_TAKEOVER_GRACE_SECONDS=30
 
+      # --- Optional policy guards (opt-in) ---
+      # The SFU is client-driven; these exist to help detect/deny unexpected client behavior.
+      # If set, compare VP9 SVC scalabilityMode against this value.
+      # - SFU_EXPECT_VP9_SVC_MODE=L2T3
+      # Strict mode: reject VP9 producers if mode mismatches (requires SFU_EXPECT_VP9_SVC_MODE).
+      # - SFU_ENFORCE_VP9_SVC_MODE=1
+      # Strict mode: reject simulcast producers that publish anything other than 2 encodings.
+      # - SFU_ENFORCE_2_LAYER_SIMULCAST=1
+
+      # --- Data channel payloads ---
+      # RomM netplay data channels are expected to be binary only.
+      # Set to 0 to allow text messages over data channels.
+      # - SFU_REQUIRE_BINARY_DATA_CHANNEL=1
+
       # Advanced: override defaults (only if you know why)
       # - USE_WEBRTC_SERVER=1
       # - LISTEN_IP=0.0.0.0
