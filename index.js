@@ -236,7 +236,49 @@ const PORT = process.env.PORT || 3001;
 // Multi-node support (optional)
 // If REDIS_URL is set, rooms are registered in Redis with a TTL so other nodes can
 // resolve which node hosts a given room.
-const REDIS_URL = process.env.REDIS_URL || null;
+function normalizeRedisUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return null;
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+
+  // Fast path.
+  try {
+    // eslint-disable-next-line no-new
+    new URL(trimmed);
+    return trimmed;
+  } catch {
+    // fall through
+  }
+
+  // Tolerant path: handle common case where password contains unescaped characters
+  // like '/' which makes new URL() throw.
+  // Example: redis://user:pa/ss@host:6379/0
+  const m = trimmed.match(/^(rediss?:)\/\/(.+)$/i);
+  if (!m) return trimmed;
+  const scheme = m[1];
+  const rest = m[2];
+  const at = rest.lastIndexOf("@");
+  if (at === -1) return trimmed;
+
+  const userInfo = rest.slice(0, at);
+  const hostAndPath = rest.slice(at + 1);
+  if (!hostAndPath) return trimmed;
+
+  const colon = userInfo.indexOf(":");
+  const username = colon === -1 ? userInfo : userInfo.slice(0, colon);
+  const password = colon === -1 ? "" : userInfo.slice(colon + 1);
+
+  try {
+    const u = new URL(`${scheme}//${hostAndPath}`);
+    if (username) u.username = username;
+    if (password) u.password = password;
+    return u.toString();
+  } catch {
+    return trimmed;
+  }
+}
+
+const REDIS_URL = normalizeRedisUrl(process.env.REDIS_URL) || null;
 const ENABLE_ROOM_REGISTRY = !!REDIS_URL;
 const ROOM_REGISTRY_KEY_PREFIX =
   process.env.ROOM_REGISTRY_KEY_PREFIX || "sfu:room:";
@@ -645,9 +687,9 @@ function buildRedisUrlFromParts(prefix) {
 // Alternative: provide parts via SFU_AUTH_REDIS_* so passwords with special characters
 // do not require manual percent-encoding.
 const SFU_AUTH_REDIS_URL =
-  process.env.SFU_AUTH_REDIS_URL ||
+  normalizeRedisUrl(process.env.SFU_AUTH_REDIS_URL) ||
   buildRedisUrlFromParts("SFU_AUTH_REDIS") ||
-  process.env.REDIS_URL ||
+  normalizeRedisUrl(process.env.REDIS_URL) ||
   null;
 
 let authRedisClient = null;

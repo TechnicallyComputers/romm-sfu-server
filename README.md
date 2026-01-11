@@ -131,3 +131,7 @@ If you use a URL (`SFU_AUTH_REDIS_URL` / `REDIS_URL`), the format is:
 
 Note: URL form requires percent-encoding special characters in the password. Using the
 `VALKEY_SFU_PASSWORD` env var (or `SFU_AUTH_REDIS_PASSWORD`) avoids that requirement.
+
+Newer SFU builds also attempt to tolerate unescaped special characters (e.g. `/`) in the
+password portion of `redis://user:password@host:port/db`, but the env-part form remains
+recommended for clarity.
