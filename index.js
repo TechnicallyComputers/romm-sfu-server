@@ -1,5 +1,6 @@
 const fs = require("fs");
 const crypto = require("crypto");
+const os = require("os");
 const http = require("http");
 const https = require("https");
 const express = require("express");
@@ -64,6 +65,62 @@ const WEBRTC_UDP_PORT = Number.parseInt(
 const ENABLE_WEBRTC_TCP = process.env.ENABLE_WEBRTC_TCP !== "0";
 const WEBRTC_TCP_PORT = Number.parseInt(
   process.env.WEBRTC_TCP_PORT || String(WEBRTC_PORT),
+  10
+);
+
+// Worker scaling
+// - SFU_WORKER_COUNT: desired mediasoup worker count.
+// - Uses os.availableParallelism() when available (container-aware).
+// - Caps to available logical cores to prevent accidental oversubscription.
+const SFU_WORKER_COUNT_RAW = Number.parseInt(
+  process.env.SFU_WORKER_COUNT || "1",
+  10
+);
+const SFU_CPU_CORES = (() => {
+  try {
+    if (typeof os.availableParallelism === "function") {
+      return Number(os.availableParallelism()) || 1;
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    const n = (os.cpus && os.cpus().length) || 1;
+    return Number(n) || 1;
+  } catch {
+    return 1;
+  }
+})();
+const SFU_WORKER_COUNT = (() => {
+  const desired = Number.isFinite(SFU_WORKER_COUNT_RAW)
+    ? SFU_WORKER_COUNT_RAW
+    : 1;
+  const normalized = Math.max(1, Math.floor(desired));
+  if (normalized > SFU_CPU_CORES) {
+    logger.warn(
+      "SFU_WORKER_COUNT exceeds available CPU cores; capping to core count",
+      {
+        requested: normalized,
+        availableCores: SFU_CPU_CORES,
+      }
+    );
+    return SFU_CPU_CORES;
+  }
+  return normalized;
+})();
+
+if (SFU_WORKER_COUNT > 1 && !USE_WEBRTC_SERVER) {
+  // Without WebRtcServer, each worker needs its own non-overlapping RTC port range.
+  // This server does not currently partition RTC_MIN_PORT/RTC_MAX_PORT, so fail fast.
+  throw new Error(
+    "SFU_WORKER_COUNT>1 requires USE_WEBRTC_SERVER=1 (per-worker WebRtcServer ports)"
+  );
+}
+
+// Optional: enable cross-worker fan-out for large rooms.
+const SFU_FANOUT_ENABLED = process.env.SFU_FANOUT_ENABLED === "1";
+const SFU_FANOUT_VIEWER_THRESHOLD = Number.parseInt(
+  process.env.SFU_FANOUT_VIEWER_THRESHOLD || "500",
   10
 );
 
@@ -843,68 +900,362 @@ io.use(async (socket, next) => {
 const peers = new Map(); // socketId -> { transports: Map, producers: Map }
 const rooms = new Map(); // roomName -> { owner: socketId, players: Map(userid->extra), maxPlayers, password }
 
-let worker;
-let router;
-let webRtcServer;
+// mediasoup runtime state
+// Worker pool allows vertical scaling on multi-core systems.
+// Each worker has its own WebRtcServer (port = WEBRTC_PORT + idx).
+const workerPool = []; // [{ idx, worker, webRtcServer, roomCount, rooms:Set<string> }]
 
-async function runMediasoup() {
-  worker = await mediasoup.createWorker({
-    rtcMinPort: RTC_MIN_PORT,
-    rtcMaxPort: RTC_MAX_PORT,
-  });
+// Per-room mediasoup state.
+// - primaryWorkerIdx: chosen by least-loaded strategy.
+// - routersByWorkerIdx: Map(workerIdx -> Router)
+// - producerPipes: Map(sourceProducerId -> { sourceWorkerIdx, perWorker: Map(workerIdx -> producerId) })
+// - dataProducerPipes: Map(sourceDataProducerId -> { sourceWorkerIdx, perWorker: Map(workerIdx -> dataProducerId) })
+// - peerCounts: Map(workerIdx -> number)
+const roomMediasoup = new Map();
 
-  worker.on("died", () => {
-    console.error("mediasoup worker died, exiting in 2 seconds...");
-    setTimeout(() => process.exit(1), 2000);
-  });
+// Track producer origin for mapping and debugging.
+const producerMeta = new Map(); // producerId -> { roomName, workerIdx, socketId, kind }
+const dataProducerMeta = new Map(); // dataProducerId -> { roomName, workerIdx, socketId, label, protocol }
 
-  const mediaCodecs = [
-    { mimeType: "audio/opus", clockRate: 48000, channels: 2 },
-    // Codec order matters for client Auto preference.
-    // Present VP9 first, then H264, then VP8.
-    { mimeType: "video/VP9", clockRate: 90000 },
-    {
-      mimeType: "video/H264",
-      clockRate: 90000,
-      parameters: { "packetization-mode": 1 },
-    },
-    { mimeType: "video/VP8", clockRate: 90000 },
-  ];
+const mediaCodecs = [
+  { mimeType: "audio/opus", clockRate: 48000, channels: 2 },
+  // Codec order matters for client Auto preference.
+  // Present VP9 first, then H264, then VP8.
+  { mimeType: "video/VP9", clockRate: 90000 },
+  {
+    mimeType: "video/H264",
+    clockRate: 90000,
+    parameters: { "packetization-mode": 1 },
+  },
+  { mimeType: "video/VP8", clockRate: 90000 },
+];
 
-  if (USE_WEBRTC_SERVER) {
-    const listenInfos = [];
-
-    const udpInfo = {
-      protocol: "udp",
-      ip: LISTEN_IP,
-      port: WEBRTC_UDP_PORT,
+function getOrCreateRoomState(roomName) {
+  let st = roomMediasoup.get(roomName);
+  if (!st) {
+    st = {
+      roomName,
+      primaryWorkerIdx: null,
+      routersByWorkerIdx: new Map(),
+      producerPipes: new Map(),
+      dataProducerPipes: new Map(),
+      peerCounts: new Map(),
     };
-    if (ANNOUNCED_ADDRESS) udpInfo.announcedAddress = ANNOUNCED_ADDRESS;
-    listenInfos.push(udpInfo);
+    roomMediasoup.set(roomName, st);
+  }
+  return st;
+}
 
-    if (ENABLE_WEBRTC_TCP) {
-      const tcpInfo = {
-        protocol: "tcp",
-        ip: LISTEN_IP,
-        port: WEBRTC_TCP_PORT,
-      };
-      if (ANNOUNCED_ADDRESS) tcpInfo.announcedAddress = ANNOUNCED_ADDRESS;
-      listenInfos.push(tcpInfo);
+function pickLeastLoadedWorkerIdx() {
+  if (workerPool.length === 0) return 0;
+  let bestIdx = 0;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < workerPool.length; i++) {
+    const w = workerPool[i];
+    const roomCount = w && typeof w.roomCount === "number" ? w.roomCount : 0;
+    if (roomCount < bestScore) {
+      bestScore = roomCount;
+      bestIdx = i;
     }
+  }
+  return bestIdx;
+}
 
-    webRtcServer = await worker.createWebRtcServer({ listenInfos });
-    logger.info("mediasoup WebRtcServer created", {
-      udpPort: WEBRTC_UDP_PORT,
-      tcpEnabled: ENABLE_WEBRTC_TCP,
-      tcpPort: ENABLE_WEBRTC_TCP ? WEBRTC_TCP_PORT : null,
-      announcedAddress: ANNOUNCED_ADDRESS,
-    });
-  } else {
-    webRtcServer = null;
+async function getOrCreateRoomRouter(roomName, workerIdx) {
+  const st = getOrCreateRoomState(roomName);
+  if (st.routersByWorkerIdx.has(workerIdx)) {
+    return st.routersByWorkerIdx.get(workerIdx);
   }
 
-  router = await worker.createRouter({ mediaCodecs });
-  logger.info("mediasoup router created");
+  const w = workerPool[workerIdx];
+  if (!w || !w.worker) throw new Error("worker not available");
+  const r = await w.worker.createRouter({ mediaCodecs });
+  st.routersByWorkerIdx.set(workerIdx, r);
+  w.rooms.add(roomName);
+  w.roomCount = w.rooms.size;
+  logger.info("mediasoup router created for room", {
+    room: roomName,
+    workerIdx,
+    roomsOnWorker: w.roomCount,
+  });
+  return r;
+}
+
+async function ensureRoomPrimaryAssigned(roomName) {
+  const st = getOrCreateRoomState(roomName);
+  if (typeof st.primaryWorkerIdx === "number") return st.primaryWorkerIdx;
+  const chosen = pickLeastLoadedWorkerIdx();
+  st.primaryWorkerIdx = chosen;
+  await getOrCreateRoomRouter(roomName, chosen);
+  return chosen;
+}
+
+function isViewerExtra(extra) {
+  // Heuristic: if player_slot is a valid controller slot, treat as a player.
+  // Viewers typically won't set it.
+  try {
+    const ps = extra && extra.player_slot;
+    if (ps === 0 || ps === 1 || ps === 2 || ps === 3) return false;
+  } catch {
+    // ignore
+  }
+  return true;
+}
+
+function getPeerAssignedWorkerIdx(socketId, roomName) {
+  const peer = peers.get(socketId);
+  if (peer && typeof peer.workerIdx === "number") return peer.workerIdx;
+  const st = roomName ? roomMediasoup.get(roomName) : null;
+  if (st && typeof st.primaryWorkerIdx === "number") return st.primaryWorkerIdx;
+  return 0;
+}
+
+function incrementRoomPeerCount(roomName, workerIdx, delta) {
+  const st = getOrCreateRoomState(roomName);
+  const prev = st.peerCounts.get(workerIdx) || 0;
+  const next = Math.max(0, prev + delta);
+  st.peerCounts.set(workerIdx, next);
+}
+
+function cleanupRoomMediasoup(roomName) {
+  try {
+    const st = roomMediasoup.get(roomName);
+    if (st && st.routersByWorkerIdx) {
+      for (const r of st.routersByWorkerIdx.values()) {
+        try {
+          r && r.close && r.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    for (const w of workerPool) {
+      if (!w || !w.rooms) continue;
+      if (w.rooms.delete(roomName)) {
+        w.roomCount = w.rooms.size;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    roomMediasoup.delete(roomName);
+  } catch {
+    // ignore
+  }
+}
+
+async function ensurePipedProducerForWorker({
+  roomName,
+  sourceProducerId,
+  targetWorkerIdx,
+}) {
+  const st = getOrCreateRoomState(roomName);
+  const pipeRec = st.producerPipes.get(sourceProducerId);
+  if (!pipeRec) return null;
+  if (pipeRec.perWorker.has(targetWorkerIdx))
+    return pipeRec.perWorker.get(targetWorkerIdx);
+
+  const sourceWorkerIdx = pipeRec.sourceWorkerIdx;
+  if (sourceWorkerIdx === targetWorkerIdx) {
+    pipeRec.perWorker.set(targetWorkerIdx, sourceProducerId);
+    return sourceProducerId;
+  }
+
+  const sourceRouter = st.routersByWorkerIdx.get(sourceWorkerIdx);
+  const targetRouter = st.routersByWorkerIdx.get(targetWorkerIdx);
+  if (!sourceRouter || !targetRouter) return null;
+
+  const { pipeProducer } = await sourceRouter.pipeToRouter({
+    producerId: sourceProducerId,
+    router: targetRouter,
+  });
+  pipeRec.perWorker.set(targetWorkerIdx, pipeProducer.id);
+  logger.info("piped producer to worker", {
+    room: roomName,
+    sourceProducerId,
+    sourceWorkerIdx,
+    targetWorkerIdx,
+    pipedProducerId: pipeProducer.id,
+  });
+  return pipeProducer.id;
+}
+
+async function registerRoomProducer({ roomName, producerId, sourceWorkerIdx }) {
+  const st = getOrCreateRoomState(roomName);
+  if (!st.producerPipes.has(producerId)) {
+    st.producerPipes.set(producerId, {
+      sourceWorkerIdx,
+      perWorker: new Map([[sourceWorkerIdx, producerId]]),
+    });
+  }
+  // If the room already has routers on other workers, pre-pipe now.
+  for (const workerIdx of st.routersByWorkerIdx.keys()) {
+    if (workerIdx === sourceWorkerIdx) continue;
+    try {
+      await ensurePipedProducerForWorker({
+        roomName,
+        sourceProducerId: producerId,
+        targetWorkerIdx: workerIdx,
+      });
+    } catch (e) {
+      logger.warn("failed piping producer", {
+        room: roomName,
+        producerId,
+        targetWorkerIdx: workerIdx,
+        error: e && e.message ? e.message : String(e),
+      });
+    }
+  }
+}
+
+async function ensurePipedDataProducerForWorker({
+  roomName,
+  sourceDataProducerId,
+  targetWorkerIdx,
+}) {
+  const st = getOrCreateRoomState(roomName);
+  const pipeRec = st.dataProducerPipes.get(sourceDataProducerId);
+  if (!pipeRec) return null;
+  if (pipeRec.perWorker.has(targetWorkerIdx))
+    return pipeRec.perWorker.get(targetWorkerIdx);
+
+  const sourceWorkerIdx = pipeRec.sourceWorkerIdx;
+  if (sourceWorkerIdx === targetWorkerIdx) {
+    pipeRec.perWorker.set(targetWorkerIdx, sourceDataProducerId);
+    return sourceDataProducerId;
+  }
+
+  const sourceRouter = st.routersByWorkerIdx.get(sourceWorkerIdx);
+  const targetRouter = st.routersByWorkerIdx.get(targetWorkerIdx);
+  if (!sourceRouter || !targetRouter) return null;
+
+  const res = await sourceRouter.pipeToRouter({
+    dataProducerId: sourceDataProducerId,
+    router: targetRouter,
+  });
+
+  const piped = res && (res.pipeDataProducer || res.pipeProducer);
+  if (!piped || !piped.id) return null;
+
+  pipeRec.perWorker.set(targetWorkerIdx, piped.id);
+  logger.info("piped dataProducer to worker", {
+    room: roomName,
+    sourceDataProducerId,
+    sourceWorkerIdx,
+    targetWorkerIdx,
+    pipedDataProducerId: piped.id,
+  });
+  return piped.id;
+}
+
+async function registerRoomDataProducer({
+  roomName,
+  dataProducerId,
+  sourceWorkerIdx,
+}) {
+  const st = getOrCreateRoomState(roomName);
+  if (!st.dataProducerPipes.has(dataProducerId)) {
+    st.dataProducerPipes.set(dataProducerId, {
+      sourceWorkerIdx,
+      perWorker: new Map([[sourceWorkerIdx, dataProducerId]]),
+    });
+  }
+  // If the room already has routers on other workers, pre-pipe now.
+  for (const workerIdx of st.routersByWorkerIdx.keys()) {
+    if (workerIdx === sourceWorkerIdx) continue;
+    try {
+      await ensurePipedDataProducerForWorker({
+        roomName,
+        sourceDataProducerId: dataProducerId,
+        targetWorkerIdx: workerIdx,
+      });
+    } catch (e) {
+      logger.warn("failed piping dataProducer", {
+        room: roomName,
+        dataProducerId,
+        targetWorkerIdx: workerIdx,
+        error: e && e.message ? e.message : String(e),
+      });
+    }
+  }
+}
+
+async function runMediasoup() {
+  logger.info("initializing mediasoup", {
+    requestedWorkers: SFU_WORKER_COUNT_RAW,
+    workerCount: SFU_WORKER_COUNT,
+    availableCores: SFU_CPU_CORES,
+    useWebRtcServer: USE_WEBRTC_SERVER,
+    baseWebRtcPort: WEBRTC_PORT,
+    udpBasePort: WEBRTC_UDP_PORT,
+    tcpEnabled: ENABLE_WEBRTC_TCP,
+    tcpBasePort: WEBRTC_TCP_PORT,
+    fanoutEnabled: SFU_FANOUT_ENABLED,
+    fanoutViewerThreshold: SFU_FANOUT_VIEWER_THRESHOLD,
+  });
+
+  workerPool.length = 0;
+  for (let idx = 0; idx < SFU_WORKER_COUNT; idx++) {
+    const w = await mediasoup.createWorker({
+      rtcMinPort: RTC_MIN_PORT,
+      rtcMaxPort: RTC_MAX_PORT,
+    });
+
+    w.on("died", () => {
+      console.error("mediasoup worker died, exiting in 2 seconds...", {
+        workerIdx: idx,
+      });
+      setTimeout(() => process.exit(1), 2000);
+    });
+
+    let webRtcServer = null;
+    if (USE_WEBRTC_SERVER) {
+      const listenInfos = [];
+
+      // Increment based on WEBRTC_PORT (and derived UDP/TCP ports).
+      const udpInfo = {
+        protocol: "udp",
+        ip: LISTEN_IP,
+        port: WEBRTC_UDP_PORT + idx,
+      };
+      if (ANNOUNCED_ADDRESS) udpInfo.announcedAddress = ANNOUNCED_ADDRESS;
+      listenInfos.push(udpInfo);
+
+      if (ENABLE_WEBRTC_TCP) {
+        const tcpInfo = {
+          protocol: "tcp",
+          ip: LISTEN_IP,
+          port: WEBRTC_TCP_PORT + idx,
+        };
+        if (ANNOUNCED_ADDRESS) tcpInfo.announcedAddress = ANNOUNCED_ADDRESS;
+        listenInfos.push(tcpInfo);
+      }
+
+      webRtcServer = await w.createWebRtcServer({ listenInfos });
+      logger.info("mediasoup WebRtcServer created", {
+        workerIdx: idx,
+        udpPort: WEBRTC_UDP_PORT + idx,
+        tcpEnabled: ENABLE_WEBRTC_TCP,
+        tcpPort: ENABLE_WEBRTC_TCP ? WEBRTC_TCP_PORT + idx : null,
+        announcedAddress: ANNOUNCED_ADDRESS,
+      });
+    }
+
+    workerPool.push({
+      idx,
+      worker: w,
+      webRtcServer,
+      roomCount: 0,
+      rooms: new Set(),
+    });
+  }
 }
 
 io.on("connection", (socket) => {
@@ -1032,16 +1383,56 @@ io.on("connection", (socket) => {
   };
 
   socket.on("sfu-available", (data, cb) => {
-    cb && cb({ available: !!router });
+    cb && cb({ available: workerPool.length > 0 });
   });
 
   socket.on("sfu-get-router-rtp-capabilities", (data, cb) => {
-    cb && cb(null, router.rtpCapabilities);
+    try {
+      const roomName = getSocketRoomName();
+      if (roomName) {
+        ensureRoomPrimaryAssigned(roomName)
+          .then((primaryIdx) => getOrCreateRoomRouter(roomName, primaryIdx))
+          .then((r) => cb && cb(null, r.rtpCapabilities))
+          .catch((e) => cb && cb(e.message || "error"));
+        return;
+      }
+
+      // Fallback before join/open: return capabilities from a temporary router
+      // on worker 0 (ensures client can bootstrap).
+      const tempRoom = "__bootstrap__";
+      ensureRoomPrimaryAssigned(tempRoom)
+        .then((primaryIdx) => getOrCreateRoomRouter(tempRoom, primaryIdx))
+        .then((r) => cb && cb(null, r.rtpCapabilities))
+        .catch((e) => cb && cb(e.message || "error"));
+    } catch (e) {
+      cb && cb(e.message || "error");
+    }
   });
 
   // Create a WebRTC transport on the SFU for the client.
   socket.on("sfu-create-transport", async ({ direction }, cb) => {
     try {
+      const roomName = getSocketRoomName();
+      if (!roomName) throw new Error("no room");
+      await ensureRoomPrimaryAssigned(roomName);
+
+      const peer = peers.get(socket.id);
+      if (!peer) throw new Error("peer not found");
+      // If the peer isn't assigned yet, default them to the room's primary worker.
+      if (typeof peer.workerIdx !== "number") {
+        const st = getOrCreateRoomState(roomName);
+        peer.workerIdx = st.primaryWorkerIdx;
+        peer.roomName = roomName;
+        incrementRoomPeerCount(roomName, peer.workerIdx, 1);
+      }
+
+      // Ensure the room has a router on this worker.
+      // For fanout, viewers may be assigned to a secondary worker.
+      const workerIdx = peer.workerIdx;
+      const roomRouter = await getOrCreateRoomRouter(roomName, workerIdx);
+      const w = workerPool[workerIdx];
+      const webRtcServer = w ? w.webRtcServer : null;
+
       const transportOptions = {
         enableUdp: true,
         enableTcp: ENABLE_WEBRTC_TCP,
@@ -1070,13 +1461,17 @@ io.on("connection", (socket) => {
         ];
       }
 
-      const transport = await router.createWebRtcTransport(transportOptions);
+      const transport = await roomRouter.createWebRtcTransport(
+        transportOptions
+      );
 
       peers.get(socket.id).transports.set(transport.id, transport);
       logger.debug("sfu-create-transport:", {
         socket: socket.id,
         direction,
         transportId: transport.id,
+        room: roomName,
+        workerIdx,
       });
 
       transport.on("dtlsstatechange", (dtlsState) => {
@@ -1184,6 +1579,27 @@ io.on("connection", (socket) => {
 
       const producer = await transport.produce({ kind, rtpParameters });
       peers.get(socket.id).producers.set(producer.id, producer);
+
+      // Record origin for mapping/piping.
+      const roomNameForProducer = getSocketRoomName();
+      const producingPeer = peers.get(socket.id);
+      const sourceWorkerIdx = producingPeer
+        ? getPeerAssignedWorkerIdx(socket.id, roomNameForProducer)
+        : 0;
+      if (roomNameForProducer) {
+        producerMeta.set(producer.id, {
+          roomName: roomNameForProducer,
+          workerIdx: sourceWorkerIdx,
+          socketId: socket.id,
+          kind,
+        });
+        // Ensure producer is registered and piped to any existing secondary routers.
+        await registerRoomProducer({
+          roomName: roomNameForProducer,
+          producerId: producer.id,
+          sourceWorkerIdx,
+        });
+      }
       logger.debug("sfu-produce: producer created", {
         socket: socket.id,
         producerId: producer.id,
@@ -1247,6 +1663,7 @@ io.on("connection", (socket) => {
           producerId: producer.id,
         });
         peers.get(socket.id).producers.delete(producer.id);
+        producerMeta.delete(producer.id);
       });
 
       // Log producer lifecycle events to aid debugging
@@ -1268,30 +1685,41 @@ io.on("connection", (socket) => {
           producerId: producer.id,
         });
         peers.get(socket.id).producers.delete(producer.id);
+        producerMeta.delete(producer.id);
       });
 
-      // Notify other clients in the same room(s) that a new producer is available.
-      for (const [roomName, room] of rooms.entries()) {
+      // Notify other clients in the same room that a new producer is available.
+      // If fan-out is enabled and the room spans multiple workers, each receiver
+      // must be told the correct producer id for its worker's router.
+      const roomName = roomNameForProducer || getSocketRoomName();
+      if (roomName && rooms.has(roomName)) {
         try {
-          // room.players is a Map of userids->extra; owner is socket id
-          const isMember =
-            room.owner === socket.id ||
-            Array.from(room.players.values()).some(
-              (p) =>
-                (p && p.socket_id === socket.id) ||
-                (p &&
-                  p.userid &&
-                  room.players.has(p.userid) &&
-                  room.players.get(p.userid) &&
-                  room.players.get(p.userid).socket_id === socket.id)
-            );
-          // Fallback: if owner matches or the socket is in the room via socket.io, emit to that room
-          if (room.owner === socket.id || socket.rooms.has(roomName)) {
-            socket.to(roomName).emit("new-producer", { id: producer.id });
-            logger.debug("broadcast new-producer to room", roomName, {
-              producerId: producer.id,
-            });
+          const st = getOrCreateRoomState(roomName);
+          const socketsInRoom = await io.in(roomName).fetchSockets();
+          for (const s of socketsInRoom) {
+            if (!s || s.id === socket.id) continue;
+            const targetWorkerIdx = getPeerAssignedWorkerIdx(s.id, roomName);
+            let idForTarget = producer.id;
+            if (
+              SFU_FANOUT_ENABLED &&
+              typeof targetWorkerIdx === "number" &&
+              typeof sourceWorkerIdx === "number" &&
+              targetWorkerIdx !== sourceWorkerIdx
+            ) {
+              // Ensure a router exists on that worker; then ensure piping.
+              await getOrCreateRoomRouter(roomName, targetWorkerIdx);
+              const pipedId = await ensurePipedProducerForWorker({
+                roomName,
+                sourceProducerId: producer.id,
+                targetWorkerIdx,
+              });
+              if (pipedId) idForTarget = pipedId;
+            }
+            s.emit("new-producer", { id: idForTarget });
           }
+          logger.debug("broadcast new-producer to room", roomName, {
+            producerId: producer.id,
+          });
         } catch (e) {
           logger.warn("Failed to broadcast new-producer to room", roomName, e);
         }
@@ -1371,6 +1799,26 @@ io.on("connection", (socket) => {
 
         peer.dataProducers.set(dataProducer.id, dataProducer);
 
+        // Record origin for mapping/piping.
+        const roomNameForProducer = getSocketRoomName();
+        const sourceWorkerIdx = peer
+          ? getPeerAssignedWorkerIdx(socket.id, roomNameForProducer)
+          : 0;
+        if (roomNameForProducer) {
+          dataProducerMeta.set(dataProducer.id, {
+            roomName: roomNameForProducer,
+            workerIdx: sourceWorkerIdx,
+            socketId: socket.id,
+            label,
+            protocol,
+          });
+          await registerRoomDataProducer({
+            roomName: roomNameForProducer,
+            dataProducerId: dataProducer.id,
+            sourceWorkerIdx,
+          });
+        }
+
         if (SFU_REQUIRE_BINARY_DATA_CHANNEL) {
           dataProducer.on("message", (message, ppid) => {
             try {
@@ -1399,22 +1847,51 @@ io.on("connection", (socket) => {
         dataProducer.on("transportclose", () => {
           try {
             peer.dataProducers.delete(dataProducer.id);
+            dataProducerMeta.delete(dataProducer.id);
           } catch (e) {}
         });
         dataProducer.on("close", () => {
           try {
             peer.dataProducers.delete(dataProducer.id);
+            dataProducerMeta.delete(dataProducer.id);
           } catch (e) {}
         });
 
-        const roomName = getSocketRoomName();
-        if (roomName) {
-          socket
-            .to(roomName)
-            .emit("new-data-producer", { id: dataProducer.id });
-          logger.debug("broadcast new-data-producer to room", roomName, {
-            dataProducerId: dataProducer.id,
-          });
+        const roomName = roomNameForProducer || getSocketRoomName();
+        if (roomName && rooms.has(roomName)) {
+          try {
+            const socketsInRoom = await io.in(roomName).fetchSockets();
+            for (const s of socketsInRoom) {
+              if (!s || s.id === socket.id) continue;
+              const targetWorkerIdx = getPeerAssignedWorkerIdx(s.id, roomName);
+              let idForTarget = dataProducer.id;
+              if (
+                SFU_FANOUT_ENABLED &&
+                typeof targetWorkerIdx === "number" &&
+                typeof sourceWorkerIdx === "number" &&
+                targetWorkerIdx !== sourceWorkerIdx
+              ) {
+                await getOrCreateRoomRouter(roomName, targetWorkerIdx);
+                const pipedId = await ensurePipedDataProducerForWorker({
+                  roomName,
+                  sourceDataProducerId: dataProducer.id,
+                  targetWorkerIdx,
+                });
+                if (pipedId) idForTarget = pipedId;
+              }
+              s.emit("new-data-producer", { id: idForTarget });
+            }
+
+            logger.debug("broadcast new-data-producer to room", roomName, {
+              dataProducerId: dataProducer.id,
+            });
+          } catch (e) {
+            logger.warn(
+              "Failed to broadcast new-data-producer to room",
+              roomName,
+              e
+            );
+          }
         }
 
         cb && cb(null, dataProducer.id);
@@ -1425,7 +1902,7 @@ io.on("connection", (socket) => {
     }
   );
 
-  socket.on("sfu-get-data-producers", (data, cb) => {
+  socket.on("sfu-get-data-producers", async (data, cb) => {
     const list = [];
     try {
       const roomName = getSocketRoomName();
@@ -1446,7 +1923,43 @@ io.on("connection", (socket) => {
         const pinfo = peers.get(sid);
         if (!pinfo || !pinfo.dataProducers) continue;
         for (const [pid] of pinfo.dataProducers) {
-          list.push({ id: pid });
+          let outId = pid;
+
+          if (SFU_FANOUT_ENABLED && workerPool.length > 1) {
+            const targetWorkerIdx = getPeerAssignedWorkerIdx(
+              socket.id,
+              roomName
+            );
+            const meta = dataProducerMeta.get(pid);
+            const sourceWorkerIdx =
+              meta && typeof meta.workerIdx === "number"
+                ? meta.workerIdx
+                : getPeerAssignedWorkerIdx(sid, roomName);
+
+            if (
+              typeof targetWorkerIdx === "number" &&
+              typeof sourceWorkerIdx === "number" &&
+              targetWorkerIdx !== sourceWorkerIdx
+            ) {
+              const st = getOrCreateRoomState(roomName);
+              if (!st.dataProducerPipes.has(pid)) {
+                st.dataProducerPipes.set(pid, {
+                  sourceWorkerIdx,
+                  perWorker: new Map([[sourceWorkerIdx, pid]]),
+                });
+              }
+              await getOrCreateRoomRouter(roomName, sourceWorkerIdx);
+              await getOrCreateRoomRouter(roomName, targetWorkerIdx);
+              const pipedId = await ensurePipedDataProducerForWorker({
+                roomName,
+                sourceDataProducerId: pid,
+                targetWorkerIdx,
+              });
+              if (pipedId) outId = pipedId;
+            }
+          }
+
+          list.push({ id: outId });
         }
       }
 
@@ -1470,33 +1983,113 @@ io.on("connection", (socket) => {
       const room = rooms.get(roomName);
       if (!room) throw new Error("no such room");
 
-      const socketIds = new Set();
-      if (room.owner) socketIds.add(room.owner);
-      for (const extra of room.players.values()) {
-        const sid = extra && (extra.socketId || extra.socket_id);
-        if (sid) socketIds.add(sid);
-      }
-
-      let dataProducer = null;
-      for (const sid of socketIds) {
-        const pinfo = peers.get(sid);
-        const dp =
-          pinfo &&
-          pinfo.dataProducers &&
-          pinfo.dataProducers.get(dataProducerId);
-        if (dp) {
-          dataProducer = dp;
-          break;
-        }
-      }
-      if (!dataProducer) throw new Error("dataProducer not found");
-
       const peer = peers.get(socket.id);
+      if (!peer) throw new Error("peer not found");
+
       const transport =
         peer && peer.transports && peer.transports.get(transportId);
       if (!transport) throw new Error("transport not found");
 
-      const dataConsumer = await transport.consumeData({ dataProducerId });
+      const consumerWorkerIdx = getPeerAssignedWorkerIdx(socket.id, roomName);
+      // Ensure the room router exists for this worker (consumeData must match router).
+      await getOrCreateRoomRouter(roomName, consumerWorkerIdx);
+
+      let effectiveDataProducerId = dataProducerId;
+
+      const tryConsume = async (id) => {
+        const dc = await transport.consumeData({ dataProducerId: id });
+        return dc;
+      };
+
+      // Fast path: if it's already a local id for this router, consume directly.
+      let dataConsumer = null;
+      try {
+        dataConsumer = await tryConsume(effectiveDataProducerId);
+      } catch {
+        dataConsumer = null;
+      }
+
+      if (!dataConsumer) {
+        // Determine source mapping for fan-out.
+        const st = getOrCreateRoomState(roomName);
+        let sourceDataProducerId = dataProducerId;
+        let sourceWorkerIdx = null;
+
+        const meta = dataProducerMeta.get(dataProducerId);
+        if (meta && typeof meta.workerIdx === "number") {
+          sourceWorkerIdx = meta.workerIdx;
+        } else {
+          const rec = st.dataProducerPipes.get(dataProducerId);
+          if (rec && typeof rec.sourceWorkerIdx === "number") {
+            sourceWorkerIdx = rec.sourceWorkerIdx;
+          }
+        }
+
+        // If they passed a piped id already, attempt to find the source mapping.
+        if (sourceWorkerIdx === null) {
+          for (const [srcId, rec] of st.dataProducerPipes.entries()) {
+            if (!rec || !rec.perWorker) continue;
+            for (const pipedId of rec.perWorker.values()) {
+              if (pipedId === dataProducerId) {
+                sourceDataProducerId = srcId;
+                sourceWorkerIdx = rec.sourceWorkerIdx;
+                break;
+              }
+            }
+            if (sourceWorkerIdx !== null) break;
+          }
+        }
+
+        // Last resort: validate the id belongs to the room by scanning known producers.
+        if (sourceWorkerIdx === null) {
+          const socketIds = new Set();
+          if (room.owner) socketIds.add(room.owner);
+          for (const extra of room.players.values()) {
+            const sid = extra && (extra.socketId || extra.socket_id);
+            if (sid) socketIds.add(sid);
+          }
+          for (const sid of socketIds) {
+            const pinfo = peers.get(sid);
+            const dp =
+              pinfo &&
+              pinfo.dataProducers &&
+              pinfo.dataProducers.get(dataProducerId);
+            if (dp) {
+              sourceWorkerIdx = getPeerAssignedWorkerIdx(sid, roomName);
+              break;
+            }
+          }
+        }
+
+        if (
+          SFU_FANOUT_ENABLED &&
+          typeof sourceWorkerIdx === "number" &&
+          consumerWorkerIdx !== sourceWorkerIdx
+        ) {
+          if (!st.dataProducerPipes.has(sourceDataProducerId)) {
+            st.dataProducerPipes.set(sourceDataProducerId, {
+              sourceWorkerIdx,
+              perWorker: new Map([[sourceWorkerIdx, sourceDataProducerId]]),
+            });
+          }
+
+          await getOrCreateRoomRouter(roomName, sourceWorkerIdx);
+          await getOrCreateRoomRouter(roomName, consumerWorkerIdx);
+
+          const pipedId = await ensurePipedDataProducerForWorker({
+            roomName,
+            sourceDataProducerId,
+            targetWorkerIdx: consumerWorkerIdx,
+          });
+          if (pipedId) {
+            effectiveDataProducerId = pipedId;
+          }
+        }
+
+        // Try again after mapping/piping.
+        dataConsumer = await tryConsume(effectiveDataProducerId);
+      }
+
       peer.dataConsumers.set(dataConsumer.id, dataConsumer);
 
       dataConsumer.on("transportclose", () => {
@@ -1525,7 +2118,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("sfu-get-producers", (data, cb) => {
+  socket.on("sfu-get-producers", async (data, cb) => {
     // Return only producers belonging to sockets in the same room.
     const list = [];
     try {
@@ -1554,7 +2147,43 @@ io.on("connection", (socket) => {
         const pinfo = peers.get(sid);
         if (!pinfo || !pinfo.producers) continue;
         for (const [pid] of pinfo.producers) {
-          list.push({ id: pid });
+          let outId = pid;
+
+          if (SFU_FANOUT_ENABLED && workerPool.length > 1) {
+            const targetWorkerIdx = getPeerAssignedWorkerIdx(
+              socket.id,
+              roomName
+            );
+            const meta = producerMeta.get(pid);
+            const sourceWorkerIdx =
+              meta && typeof meta.workerIdx === "number"
+                ? meta.workerIdx
+                : getPeerAssignedWorkerIdx(sid, roomName);
+
+            if (
+              typeof targetWorkerIdx === "number" &&
+              typeof sourceWorkerIdx === "number" &&
+              targetWorkerIdx !== sourceWorkerIdx
+            ) {
+              const st = getOrCreateRoomState(roomName);
+              if (!st.producerPipes.has(pid)) {
+                st.producerPipes.set(pid, {
+                  sourceWorkerIdx,
+                  perWorker: new Map([[sourceWorkerIdx, pid]]),
+                });
+              }
+              await getOrCreateRoomRouter(roomName, sourceWorkerIdx);
+              await getOrCreateRoomRouter(roomName, targetWorkerIdx);
+              const pipedId = await ensurePipedProducerForWorker({
+                roomName,
+                sourceProducerId: pid,
+                targetWorkerIdx,
+              });
+              if (pipedId) outId = pipedId;
+            }
+          }
+
+          list.push({ id: outId });
         }
       }
 
@@ -1595,6 +2224,24 @@ io.on("connection", (socket) => {
       players.set(storedExtra.userid, storedExtra);
       rooms.set(roomName, { owner: socket.id, players, maxPlayers, password });
       locallyHostedRooms.add(roomName);
+
+      // Room assignment: choose a worker using least-loaded strategy and
+      // create a dedicated router for this room on that worker.
+      await ensureRoomPrimaryAssigned(roomName);
+
+      // Pin the owner socket to the room's primary worker.
+      try {
+        const peer = peers.get(socket.id);
+        if (peer) {
+          const st = getOrCreateRoomState(roomName);
+          peer.roomName = roomName;
+          peer.workerIdx = st.primaryWorkerIdx;
+          peer.role = "owner";
+          incrementRoomPeerCount(roomName, peer.workerIdx, 1);
+        }
+      } catch (e) {
+        // ignore
+      }
       if (ENABLE_ROOM_REGISTRY) {
         registryUpsertRoom(roomName).catch((e) => {
           logger.warn("failed to upsert room registry", e);
@@ -1706,6 +2353,61 @@ io.on("connection", (socket) => {
       room.players.set(storedExtra.userid, storedExtra);
       socket.join(roomName);
 
+      // Assign this socket to a worker for this room.
+      // Persistence: once assigned, the socket stays on that worker for all SFU operations.
+      try {
+        await ensureRoomPrimaryAssigned(roomName);
+        const peer = peers.get(socket.id);
+        if (peer) {
+          peer.roomName = roomName;
+          // Default: same worker as the room's primary router.
+          let chosenWorkerIdx = getOrCreateRoomState(roomName).primaryWorkerIdx;
+
+          // Fan-out: distribute viewers across workers once the room is large.
+          const roomRec = rooms.get(roomName);
+          const roomSize =
+            roomRec && roomRec.players ? roomRec.players.size : 0;
+          const viewer = isViewerExtra(storedExtra);
+          if (
+            SFU_FANOUT_ENABLED &&
+            viewer &&
+            workerPool.length > 1 &&
+            roomSize >= SFU_FANOUT_VIEWER_THRESHOLD
+          ) {
+            // Ensure routers exist on additional workers as we need them.
+            // Pick the worker with the fewest peers for this room.
+            const st = getOrCreateRoomState(roomName);
+            let bestIdx = chosenWorkerIdx;
+            let bestPeers = st.peerCounts.get(bestIdx) || 0;
+            for (let i = 0; i < workerPool.length; i++) {
+              const c = st.peerCounts.get(i) || 0;
+              if (c < bestPeers) {
+                bestPeers = c;
+                bestIdx = i;
+              }
+            }
+            chosenWorkerIdx = bestIdx;
+            await getOrCreateRoomRouter(roomName, chosenWorkerIdx);
+          }
+
+          peer.workerIdx = chosenWorkerIdx;
+          peer.role = viewer ? "viewer" : "player";
+          incrementRoomPeerCount(roomName, chosenWorkerIdx, 1);
+          logger.info("assigned socket to room worker", {
+            room: roomName,
+            socket: socket.id,
+            workerIdx: chosenWorkerIdx,
+            role: peer.role,
+          });
+        }
+      } catch (e) {
+        logger.warn("failed to assign socket to room worker", {
+          room: roomName,
+          socket: socket.id,
+          error: e && e.message ? e.message : String(e),
+        });
+      }
+
       // If we took over from a still-connected socket, ensure the room stays stable.
       if (takeoverSid) {
         if (takeoverWasOwner) {
@@ -1744,6 +2446,25 @@ io.on("connection", (socket) => {
       const room = rooms.get(roomName);
       if (!room) return cb && cb("no such room");
 
+      // Update per-room worker accounting.
+      try {
+        const peer = peers.get(socket.id);
+        if (
+          peer &&
+          peer.roomName === roomName &&
+          typeof peer.workerIdx === "number"
+        ) {
+          incrementRoomPeerCount(roomName, peer.workerIdx, -1);
+        }
+        if (peer && peer.roomName === roomName) {
+          peer.roomName = null;
+          peer.workerIdx = undefined;
+          peer.role = undefined;
+        }
+      } catch {
+        // ignore
+      }
+
       // Do not trust client-supplied userid here. Only the bound userid for this
       // network connection may leave.
       const assignedUserid = getAssignedUserid();
@@ -1771,6 +2492,7 @@ io.on("connection", (socket) => {
       if (room.players.size === 0) {
         rooms.delete(roomName);
         locallyHostedRooms.delete(roomName);
+        cleanupRoomMediasoup(roomName);
         if (ENABLE_ROOM_REGISTRY) {
           registryDeleteRoom(roomName).catch((e) => {
             logger.warn("failed to delete room registry", e);
@@ -1890,19 +2612,105 @@ io.on("connection", (socket) => {
           producerId,
           transportId,
         });
-        if (!router.canConsume({ producerId, rtpCapabilities })) {
+
+        const roomName = getSocketRoomName();
+        if (!roomName) throw new Error("no room");
+        if (!rooms.has(roomName)) throw new Error("no such room");
+
+        const peer = peers.get(socket.id);
+        if (!peer) throw new Error("peer not found");
+
+        const consumerWorkerIdx = getPeerAssignedWorkerIdx(socket.id, roomName);
+        const consumerRouter = await getOrCreateRoomRouter(
+          roomName,
+          consumerWorkerIdx
+        );
+
+        let effectiveProducerId = producerId;
+
+        const canConsumeDirect = () => {
+          try {
+            return consumerRouter.canConsume({
+              producerId: effectiveProducerId,
+              rtpCapabilities,
+            });
+          } catch {
+            return false;
+          }
+        };
+
+        if (!canConsumeDirect()) {
+          // If fan-out is enabled, the client may be requesting a source producerId
+          // that lives on another worker. Try to map it to a piped producer on this worker.
+          const st = getOrCreateRoomState(roomName);
+          let sourceProducerId = producerId;
+          let sourceWorkerIdx = null;
+
+          const meta = producerMeta.get(producerId);
+          if (meta && typeof meta.workerIdx === "number") {
+            sourceWorkerIdx = meta.workerIdx;
+          } else {
+            const rec = st.producerPipes.get(producerId);
+            if (rec && typeof rec.sourceWorkerIdx === "number") {
+              sourceWorkerIdx = rec.sourceWorkerIdx;
+            }
+          }
+
+          // If they passed a piped id already, attempt to find the source mapping.
+          if (sourceWorkerIdx === null) {
+            for (const [srcId, rec] of st.producerPipes.entries()) {
+              if (!rec || !rec.perWorker) continue;
+              for (const pipedId of rec.perWorker.values()) {
+                if (pipedId === producerId) {
+                  sourceProducerId = srcId;
+                  sourceWorkerIdx = rec.sourceWorkerIdx;
+                  break;
+                }
+              }
+              if (sourceWorkerIdx !== null) break;
+            }
+          }
+
+          if (
+            SFU_FANOUT_ENABLED &&
+            typeof sourceWorkerIdx === "number" &&
+            consumerWorkerIdx !== sourceWorkerIdx
+          ) {
+            if (!st.producerPipes.has(sourceProducerId)) {
+              st.producerPipes.set(sourceProducerId, {
+                sourceWorkerIdx,
+                perWorker: new Map([[sourceWorkerIdx, sourceProducerId]]),
+              });
+            }
+
+            await getOrCreateRoomRouter(roomName, sourceWorkerIdx);
+            await getOrCreateRoomRouter(roomName, consumerWorkerIdx);
+
+            const pipedId = await ensurePipedProducerForWorker({
+              roomName,
+              sourceProducerId,
+              targetWorkerIdx: consumerWorkerIdx,
+            });
+            if (pipedId) {
+              effectiveProducerId = pipedId;
+            }
+          }
+        }
+
+        if (!canConsumeDirect()) {
           throw new Error("cannot consume");
         }
-        const transportOwner = peers.get(socket.id).transports.get(transportId);
+
+        const transportOwner = peer.transports.get(transportId);
         if (!transportOwner) throw new Error("transport not found");
 
         const consumer = await transportOwner.consume({
-          producerId,
+          producerId: effectiveProducerId,
           rtpCapabilities,
           paused: false,
         });
 
-        peers.get(socket.id).consumers.set(consumer.id, consumer);
+        peer.consumers.set(consumer.id, consumer);
 
         logger.debug("sfu-consume: consumer created", {
           socket: socket.id,
@@ -1924,9 +2732,7 @@ io.on("connection", (socket) => {
         } catch (e) {
           logger.warn("failed to summarize consumer rtpParameters", e);
         }
-        consumer.on("transportclose", () =>
-          peers.get(socket.id).consumers.delete(consumer.id)
-        );
+        consumer.on("transportclose", () => peer.consumers.delete(consumer.id));
 
         const params = {
           id: consumer.id,
@@ -1960,11 +2766,27 @@ io.on("connection", (socket) => {
   socket.on("disconnect", (reason) => {
     logger.debug("client disconnected", socket.id, { reason });
 
+    // Update per-room worker accounting for this peer.
+    try {
+      const peer = peers.get(socket.id);
+      if (
+        peer &&
+        peer.roomName &&
+        typeof peer.workerIdx === "number" &&
+        rooms.has(peer.roomName)
+      ) {
+        incrementRoomPeerCount(peer.roomName, peer.workerIdx, -1);
+      }
+    } catch {
+      // ignore
+    }
+
     // Remove from any rooms and notify members.
     for (const [roomName, room] of rooms.entries()) {
       if (room.owner === socket.id) {
         rooms.delete(roomName);
         locallyHostedRooms.delete(roomName);
+        cleanupRoomMediasoup(roomName);
         if (ENABLE_ROOM_REGISTRY) {
           registryDeleteRoom(roomName).catch((e) => {
             logger.warn("failed to delete room registry", e);
@@ -1990,6 +2812,7 @@ io.on("connection", (socket) => {
         if (room.players.size === 0) {
           rooms.delete(roomName);
           locallyHostedRooms.delete(roomName);
+          cleanupRoomMediasoup(roomName);
           if (ENABLE_ROOM_REGISTRY) {
             registryDeleteRoom(roomName).catch((e) => {
               logger.warn("failed to delete room registry", e);
