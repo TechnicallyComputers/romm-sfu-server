@@ -711,7 +711,12 @@ app.get("/ice", async (req, res) => {
   }
 });
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, {
+  cors: { origin: "*" },
+  // Keep the SFU Socket.IO endpoint distinct from RomM's app Socket.IO
+  // (RomM uses /ws/socket.io via the backend mount).
+  path: "/socket.io",
+});
 
 // --- SFU authentication (RoMM-issued JWT + one-time JTI allowlist via RomM API) ---
 //
