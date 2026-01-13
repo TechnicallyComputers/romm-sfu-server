@@ -13,16 +13,21 @@ There is also a ready-to-copy compose file: `docker-compose.example.yml`.
 
 ### Compose quickstart (minimal)
 
-This SFU is "secure by default": auth is always required, so you only need to provide:
+This SFU is "secure by default": auth is always required.
 
-- `ROMM_AUTH_SECRET_KEY` (must match RomM)
-- `VALKEY_SFU_PASSWORD` (Redis/Valkey password for the `sfu` user)
+The SFU does **not** connect to Redis/Valkey directly. Instead, it calls back into RomM's
+internal SFU API to validate JWT/JTI and to store/resolve room registry records.
+
+You only need to provide:
+
+- `ROMM_API_BASE_URL` (RomM base URL reachable from the SFU container, e.g. `http://romm:8080`)
+- `ROMM_SFU_INTERNAL_SECRET` (shared secret for SFU->RomM calls; must NOT be `ROMM_AUTH_SECRET_KEY`)
 
 Everything else has sensible defaults (ports, takeover grace window, STUN default).
 
 Example:
 
-- `ROMM_AUTH_SECRET_KEY=... VALKEY_SFU_PASSWORD=... docker compose up -d`
+- `ROMM_API_BASE_URL=http://romm:8080 ROMM_SFU_INTERNAL_SECRET=... docker compose up -d`
 
 ## Ports
 
@@ -40,7 +45,18 @@ listening port. This lets you open a single UDP port in your firewall/NAT instea
   - If clients connect over the public internet and the SFU is behind NAT (typical home server / VPS behind a proxy), you almost always need this.
   - If all clients are on the same LAN and can reach the SFU directly by its LAN IP, you can usually omit it.
 - `SFU_STUN_SERVERS` (optional): STUN servers for clients, comma/space separated (example: `stun.l.google.com:19302,stun1.example.com:3478`).
-  If unset, defaults to `stun.l.google.com:19302`. Values are forced to STUN; any `turn:` / `turns:` entries are ignored.
+  If unset, defaults to `stun.l.google.com:19302`.
+- TURN servers (optional): configure via either `SFU_TURN_SERVERS` (recommended) or numbered env vars.
+  - Recommended (arbitrary count): `SFU_TURN_SERVERS` as JSON array of RTCIceServer objects.
+    Example:
+    - `SFU_TURN_SERVERS=[{"urls":["turn:turn.example.com:3478?transport=udp","turn:turn.example.com:3478?transport=tcp"],"username":"user","credential":"pass"}]`
+  - Simple fallback (up to 4):
+    - `SFU_TURN_SERVER1=turn:turn.example.com:3478?transport=udp`
+    - `SFU_TURN_USER1=user`
+    - `SFU_TURN_PASS1=pass`
+    - Repeat for `2..4`.
+      Notes:
+  - TURN credentials are delivered to clients as part of the WebRTC config. Prefer short-lived credentials (TURN REST API) if possible.
 - `WEBRTC_PORT` (default `20000`): shared WebRTC media port (UDP + TCP).
 - `WEBRTC_UDP_PORT` (optional): override UDP port (defaults to `WEBRTC_PORT`).
 - `ENABLE_WEBRTC_TCP` (default `1`): set to `0` to disable TCP candidates.
@@ -64,30 +80,26 @@ RomM netplay data channels are expected to be binary only.
 
 ## Multi-node / scaling
 
-This server can run as multiple SFU nodes (horizontal scaling) using a Redis-backed
+This server can run as multiple SFU nodes (horizontal scaling) using a RomM-backed
 room registry. Each room is "sticky" to the node that created it.
 
 How it works:
 
-- When a room is opened, that node registers `room_name -> { url, nodeId }` in Redis with a TTL.
+- When a room is opened, that node registers `room_name -> { url, nodeId }` in RomM (with a TTL).
 - Other nodes can list rooms cluster-wide via `/list` and resolve a room via `/resolve?room=...`.
 - If a client tries to `join-room` on a node that doesn't host the room, the server emits `room-redirect`
   and also returns `{ redirect: <url> }` via the join callback.
 
 ### Registry environment variables
 
-- `REDIS_URL`: enable the registry (example: `redis://romm:<password>@127.0.0.1:6379/0`)
+- `ROMM_API_BASE_URL`: enable the registry (example: `http://romm:8080`)
+- `ROMM_SFU_INTERNAL_SECRET`: secret for SFU->RomM internal API calls
 - `PUBLIC_URL`: the public signaling URL for this node (example: `https://sfu-2.example.com`)
 - `NODE_ID` (optional): stable id for this node (defaults to a random UUID)
-- `ROOM_REGISTRY_KEY_PREFIX` (default `romm:sfu:room:`): Redis key prefix
-- `ROOM_REGISTRY_TTL_SECONDS` (default `60`): TTL for room registry entries
+- `ROOM_REGISTRY_TTL_SECONDS` (default `60`): refresh interval hint for re-upserts
 
 ### Notes
 
-- If your Redis/Valkey uses ACLs and the `default` user is disabled (for example, `user default off`),
-  `REDIS_URL` must include `username:password@...` or registry operations will fail with `NOAUTH`.
-- `REDIS_URL` is intended for the optional _room registry_ (multi-node). For SFU auth allowlist,
-  prefer `SFU_AUTH_REDIS_*` (or `SFU_AUTH_REDIS_URL`) so auth does not depend on registry settings.
 - For best results, put your SFU nodes behind a load balancer for initial connections.
   Once a client knows the room host, it should connect directly to that node's `PUBLIC_URL`.
 - True cross-node media forwarding (a single room spanning multiple nodes) is not implemented here;
@@ -114,24 +126,9 @@ This avoids spurious `userid in use` errors during fast network transitions.
   existing connection looks "stale" and the overlap is recent. This helps avoid surprise takeovers
   when the same account is used from another device. Set to `0` to remove the grace window.
 
-## Auth Redis URL format (SFU_REQUIRE_AUTH)
+## RomM internal API auth
 
-Auth mode requires BOTH a JWT secret and an auth Redis connection.
+The SFU talks to RomM using a shared secret header:
 
-- Secret: `ROMM_AUTH_SECRET_KEY` (or `SFU_AUTH_SECRET_KEY`)
-- Redis:
-  - Preferred: `SFU_AUTH_REDIS_HOST/PORT/DB/USERNAME/PASSWORD`
-  - `SFU_AUTH_REDIS_URL` (recommended if you already have a full URL)
-  - Backwards-compat: if neither is set, the server falls back to `REDIS_URL`
-
-If you use a URL (`SFU_AUTH_REDIS_URL` / `REDIS_URL`), the format is:
-
-- `redis://[username[:password]@]host:port/db`
-- `rediss://[username[:password]@]host:port/db`
-
-Note: URL form requires percent-encoding special characters in the password. Using the
-`VALKEY_SFU_PASSWORD` env var (or `SFU_AUTH_REDIS_PASSWORD`) avoids that requirement.
-
-Newer SFU builds also attempt to tolerate unescaped special characters (e.g. `/`) in the
-password portion of `redis://user:password@host:port/db`, but the env-part form remains
-recommended for clarity.
+- Header: `x-romm-sfu-secret: <secret>`
+- Secret: `ROMM_SFU_INTERNAL_SECRET`

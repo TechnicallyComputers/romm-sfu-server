@@ -1,6 +1,7 @@
 const fs = require("fs");
 const crypto = require("crypto");
 const http = require("http");
+const https = require("https");
 const express = require("express");
 const { Server } = require("socket.io");
 const mediasoup = require("mediasoup");
@@ -176,112 +177,191 @@ function isBinaryDataChannelMessage(message, ppid) {
   return false;
 }
 
-function parseStunIceServersFromEnv() {
+function normalizeIceUrl(url, defaultScheme) {
+  const t = String(url || "")
+    .trim()
+    .replace(/^\/\//, "");
+  if (!t) return null;
+  const lower = t.toLowerCase();
+
+  if (
+    lower.startsWith("stun:") ||
+    lower.startsWith("stuns:") ||
+    lower.startsWith("turn:") ||
+    lower.startsWith("turns:")
+  ) {
+    return t;
+  }
+
+  // If they provided some other scheme (e.g. https://), ignore it.
+  if (lower.includes("://")) return null;
+
+  return `${defaultScheme}:${t}`;
+}
+
+function splitServerTokens(raw) {
+  return String(raw || "")
+    .split(/[\s,]+/)
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+}
+
+function parseStunServersFromEnv() {
   const raw = (
     process.env.SFU_STUN_SERVERS ||
     process.env.STUN_SERVERS ||
     ""
   ).trim();
+
+  // Keep a sane default when unset.
   if (!raw) return [{ urls: "stun:stun.l.google.com:19302" }];
 
-  // Accept comma-separated and/or whitespace-separated values.
-  // Examples:
-  //   SFU_STUN_SERVERS=stun.l.google.com:19302,stun1.example.com:3478
-  //   SFU_STUN_SERVERS="stun:stun.l.google.com:19302 stun:stun1.example.com:3478"
-  const tokens = raw
-    .split(/[\s,]+/)
-    .map((s) => String(s || "").trim())
-    .filter(Boolean);
-
   const out = [];
-  for (const token of tokens) {
-    const t = token.replace(/^\/\//, "");
-    const lower = t.toLowerCase();
-
-    // Hard block TURN: this SFU is intended to remove TURN from the stack.
-    if (lower.startsWith("turn:") || lower.startsWith("turns:")) {
-      logger.warn("Ignoring TURN ICE server (TURN is not supported)", {
-        value: token,
-      });
-      continue;
-    }
-
-    // Allow explicit stun:/stuns: URLs.
-    if (lower.startsWith("stun:") || lower.startsWith("stuns:")) {
-      out.push({ urls: t });
-      continue;
-    }
-
-    // If they provided some other scheme, ignore it.
-    if (lower.includes("://")) {
+  for (const token of splitServerTokens(raw)) {
+    const url = normalizeIceUrl(token, "stun");
+    if (!url) {
       logger.warn("Ignoring ICE server with unsupported scheme", {
         value: token,
       });
       continue;
     }
-
-    // Bare host[:port] (no prefix) -> stun:host[:port]
-    out.push({ urls: `stun:${t}` });
+    // Only allow STUN in this variable (TURN has separate env vars).
+    const lower = url.toLowerCase();
+    if (lower.startsWith("turn:") || lower.startsWith("turns:")) {
+      logger.warn(
+        "Ignoring TURN ICE server in SFU_STUN_SERVERS; use SFU_TURN_SERVERS/SFU_TURN_SERVER*",
+        { value: token }
+      );
+      continue;
+    }
+    out.push({ urls: url });
   }
 
   return out;
 }
 
-const SFU_ICE_SERVERS = parseStunIceServersFromEnv();
+function parseTurnServersFromJsonEnv() {
+  const raw = String(process.env.SFU_TURN_SERVERS || "").trim();
+  if (!raw) return [];
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    logger.warn("Invalid SFU_TURN_SERVERS JSON; ignoring", {
+      length: raw.length,
+    });
+    return [];
+  }
+
+  if (!Array.isArray(parsed)) {
+    logger.warn("SFU_TURN_SERVERS must be a JSON array; ignoring", {
+      type: typeof parsed,
+    });
+    return [];
+  }
+
+  const out = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== "object") continue;
+    const urlsRaw = entry.urls;
+    const username =
+      entry.username !== undefined && entry.username !== null
+        ? String(entry.username)
+        : null;
+    const credential =
+      entry.credential !== undefined && entry.credential !== null
+        ? String(entry.credential)
+        : null;
+
+    const urls = Array.isArray(urlsRaw) ? urlsRaw : [urlsRaw];
+    const normalizedUrls = [];
+    for (const u of urls) {
+      if (typeof u !== "string") continue;
+      const nu = normalizeIceUrl(u, "turn");
+      if (!nu) continue;
+      const lower = nu.toLowerCase();
+      if (!lower.startsWith("turn:") && !lower.startsWith("turns:")) continue;
+      normalizedUrls.push(nu);
+    }
+    if (normalizedUrls.length === 0) continue;
+    if (!username || !credential) {
+      logger.warn(
+        "Ignoring TURN server from SFU_TURN_SERVERS without username/credential"
+      );
+      continue;
+    }
+    out.push({ urls: normalizedUrls, username, credential });
+  }
+
+  return out;
+}
+
+function parseTurnServersFromNumberedEnv(limit = 4) {
+  const out = [];
+  for (let i = 1; i <= limit; i++) {
+    const server = String(process.env[`SFU_TURN_SERVER${i}`] || "").trim();
+    if (!server) continue;
+
+    const username = String(process.env[`SFU_TURN_USER${i}`] || "").trim();
+    const credential = String(process.env[`SFU_TURN_PASS${i}`] || "").trim();
+    if (!username || !credential) {
+      logger.warn(
+        `Ignoring SFU_TURN_SERVER${i} because SFU_TURN_USER${i} or SFU_TURN_PASS${i} is missing`
+      );
+      continue;
+    }
+
+    const urls = [];
+    for (const token of splitServerTokens(server)) {
+      const url = normalizeIceUrl(token, "turn");
+      if (!url) continue;
+      const lower = url.toLowerCase();
+      if (!lower.startsWith("turn:") && !lower.startsWith("turns:")) continue;
+      urls.push(url);
+    }
+
+    if (urls.length === 0) {
+      logger.warn(
+        `Ignoring SFU_TURN_SERVER${i} because no valid TURN urls were found`
+      );
+      continue;
+    }
+
+    out.push({ urls, username, credential });
+  }
+  return out;
+}
+
+function parseIceServersFromEnv() {
+  const stun = parseStunServersFromEnv();
+  const turn = [
+    ...parseTurnServersFromJsonEnv(),
+    ...parseTurnServersFromNumberedEnv(4),
+  ];
+  return [...stun, ...turn];
+}
+
+const SFU_ICE_SERVERS = parseIceServersFromEnv();
 
 // Signalling port must remain open and available even when using WebRtcServer.
 // Default differs from common 3000 dev ports (e.g. Vite).
 const PORT = process.env.PORT || 3001;
 
 // Multi-node support (optional)
-// If REDIS_URL is set, rooms are registered in Redis with a TTL so other nodes can
-// resolve which node hosts a given room.
-function normalizeRedisUrl(rawUrl) {
-  if (!rawUrl || typeof rawUrl !== "string") return null;
-  const trimmed = rawUrl.trim();
-  if (!trimmed) return null;
+// Rooms are registered in RomM (which stores them in its internal Valkey/Redis).
+// This avoids exposing Redis to SFU nodes.
+const ROMM_API_BASE_URL = (
+  process.env.ROMM_API_BASE_URL ||
+  process.env.ROMM_BASE_URL ||
+  process.env.ROMM_URL ||
+  ""
+).trim();
+const ROMM_SFU_INTERNAL_SECRET = process.env.ROMM_SFU_INTERNAL_SECRET || "";
+const USE_ROMM_INTERNAL_API = !!ROMM_API_BASE_URL;
 
-  // Fast path.
-  try {
-    // eslint-disable-next-line no-new
-    new URL(trimmed);
-    return trimmed;
-  } catch {
-    // fall through
-  }
+const ENABLE_ROOM_REGISTRY = USE_ROMM_INTERNAL_API;
 
-  // Tolerant path: handle common case where password contains unescaped characters
-  // like '/' which makes new URL() throw.
-  // Example: redis://user:pa/ss@host:6379/0
-  const m = trimmed.match(/^(rediss?:)\/\/(.+)$/i);
-  if (!m) return trimmed;
-  const scheme = m[1];
-  const rest = m[2];
-  const at = rest.lastIndexOf("@");
-  if (at === -1) return trimmed;
-
-  const userInfo = rest.slice(0, at);
-  const hostAndPath = rest.slice(at + 1);
-  if (!hostAndPath) return trimmed;
-
-  const colon = userInfo.indexOf(":");
-  const username = colon === -1 ? userInfo : userInfo.slice(0, colon);
-  const password = colon === -1 ? "" : userInfo.slice(colon + 1);
-
-  try {
-    const u = new URL(`${scheme}//${hostAndPath}`);
-    if (username) u.username = username;
-    if (password) u.password = password;
-    return u.toString();
-  } catch {
-    return trimmed;
-  }
-}
-
-const REDIS_URL = normalizeRedisUrl(process.env.REDIS_URL) || null;
-const ENABLE_ROOM_REGISTRY = !!REDIS_URL;
-const ROOM_REGISTRY_KEY_PREFIX =
-  process.env.ROOM_REGISTRY_KEY_PREFIX || "sfu:room:";
 const ROOM_REGISTRY_TTL_SECONDS = Number.parseInt(
   process.env.ROOM_REGISTRY_TTL_SECONDS || "60",
   10
@@ -290,59 +370,97 @@ const NODE_ID = process.env.NODE_ID || crypto.randomUUID();
 // Public URL that clients should use to reach this node (signaling base URL).
 // In multi-node deployments behind a LB, set this explicitly.
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${String(PORT)}`;
-
-let redisClient = null;
 const locallyHostedRooms = new Set();
 
-function isRedisNoAuthError(err) {
-  if (!err) return false;
-  const msg = err && err.message ? String(err.message) : String(err);
-  return msg.includes("NOAUTH") || msg.includes("Authentication required");
-}
+function rommInternalRequest({ method, path, body, timeoutMs = 5000 }) {
+  if (!USE_ROMM_INTERNAL_API) {
+    throw new Error("RomM internal API not configured (ROMM_API_BASE_URL)");
+  }
+  if (!ROMM_SFU_INTERNAL_SECRET) {
+    throw new Error(
+      "RomM internal API secret missing (ROMM_SFU_INTERNAL_SECRET)"
+    );
+  }
 
-async function disableRoomRegistry(reason) {
-  if (!redisClient) return;
-  try {
-    logger.warn("Disabling room registry (Redis error)", {
-      reason: reason && reason.message ? reason.message : String(reason),
+  const url = new URL(path, ROMM_API_BASE_URL);
+  const isHttps = url.protocol === "https:";
+  const lib = isHttps ? https : http;
+
+  const payload = body === undefined ? null : JSON.stringify(body);
+  const headers = {
+    "x-romm-sfu-secret": ROMM_SFU_INTERNAL_SECRET,
+    Accept: "application/json",
+  };
+  if (payload !== null) {
+    headers["Content-Type"] = "application/json";
+    headers["Content-Length"] = Buffer.byteLength(payload);
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = lib.request(
+      {
+        method,
+        hostname: url.hostname,
+        port: url.port || (isHttps ? 443 : 80),
+        path: url.pathname + url.search,
+        headers,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => {
+          const raw = Buffer.concat(chunks).toString("utf8");
+          const code = res.statusCode || 0;
+
+          if (code >= 400) {
+            let detail = "";
+            if (code === 403 && typeof raw === "string") {
+              const lower = raw.toLowerCase();
+              if (
+                lower.includes("csrf") &&
+                lower.includes("verification failed")
+              ) {
+                detail =
+                  " (likely CSRF protection blocking SFU internal API; RomM must exempt /api/sfu/internal/* from CSRF)";
+              }
+            }
+            const err = new Error(
+              `RomM internal API error ${code} for ${method} ${url.pathname}${detail}`
+            );
+            err.statusCode = code;
+            err.body = raw;
+            return reject(err);
+          }
+
+          if (!raw) return resolve(null);
+          try {
+            return resolve(JSON.parse(raw));
+          } catch {
+            return resolve(null);
+          }
+        });
+      }
+    );
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error("RomM internal API request timeout"));
     });
-  } catch {
-    // ignore
-  }
 
-  try {
-    await redisClient.disconnect();
-  } catch {
-    // ignore
-  }
-  redisClient = null;
+    req.on("error", reject);
+    if (payload !== null) req.write(payload);
+    req.end();
+  });
 }
 
 async function initRoomRegistry() {
   if (!ENABLE_ROOM_REGISTRY) return;
 
-  // Lazy require so single-node setups do not need the dependency.
-  // Install with: npm i redis
-  // Using redis v4 client.
-  const { createClient } = require("redis");
-  redisClient = createClient({ url: REDIS_URL });
-  redisClient.on("error", (err) => {
-    logger.error("Redis error", err);
-  });
-
-  try {
-    await redisClient.connect();
-  } catch (err) {
-    await disableRoomRegistry(err);
-    return;
-  }
-  logger.info("Room registry enabled", {
+  logger.info("Room registry enabled (via RomM)", {
     nodeId: NODE_ID,
     publicUrl: PUBLIC_URL,
     ttlSeconds: ROOM_REGISTRY_TTL_SECONDS,
   });
 
-  // Refresh keys periodically to prevent TTL expiry while rooms are active.
   const refreshMs = Math.max(
     5000,
     Math.floor((ROOM_REGISTRY_TTL_SECONDS * 1000) / 2)
@@ -354,12 +472,8 @@ async function initRoomRegistry() {
   }, refreshMs).unref();
 }
 
-function getRoomRegistryKey(roomName) {
-  return `${ROOM_REGISTRY_KEY_PREFIX}${roomName}`;
-}
-
 async function registryUpsertRoom(roomName) {
-  if (!redisClient) return;
+  if (!ENABLE_ROOM_REGISTRY) return;
   const room = rooms.get(roomName);
   if (!room) return;
 
@@ -373,124 +487,50 @@ async function registryUpsertRoom(roomName) {
     updatedAt: Date.now(),
   };
 
-  try {
-    await redisClient.set(
-      getRoomRegistryKey(roomName),
-      JSON.stringify(record),
-      {
-        EX: ROOM_REGISTRY_TTL_SECONDS,
-      }
-    );
-  } catch (err) {
-    if (isRedisNoAuthError(err)) {
-      await disableRoomRegistry(err);
-      return;
-    }
-    throw err;
-  }
+  await rommInternalRequest({
+    method: "POST",
+    path: "/api/sfu/internal/rooms/upsert",
+    body: record,
+  });
 }
 
 async function registryDeleteRoom(roomName) {
-  if (!redisClient) return;
-  try {
-    await redisClient.del(getRoomRegistryKey(roomName));
-  } catch (err) {
-    if (isRedisNoAuthError(err)) {
-      await disableRoomRegistry(err);
-      return;
-    }
-    throw err;
-  }
+  if (!ENABLE_ROOM_REGISTRY) return;
+  await rommInternalRequest({
+    method: "POST",
+    path: "/api/sfu/internal/rooms/delete",
+    body: { room_name: roomName },
+  });
 }
 
 async function registryResolveRoom(roomName) {
-  if (!redisClient) return null;
-  let raw;
+  if (!ENABLE_ROOM_REGISTRY) return null;
   try {
-    raw = await redisClient.get(getRoomRegistryKey(roomName));
+    const rec = await rommInternalRequest({
+      method: "GET",
+      path: `/api/sfu/internal/rooms/resolve?room=${encodeURIComponent(
+        roomName
+      )}`,
+    });
+    return rec || null;
   } catch (err) {
-    if (isRedisNoAuthError(err)) {
-      await disableRoomRegistry(err);
-      return null;
-    }
+    if (err && err.statusCode === 404) return null;
     throw err;
-  }
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
   }
 }
 
 async function registryListRooms() {
-  if (!redisClient) return null;
-  const out = {};
-
-  let cursor = 0;
-  const match = `${ROOM_REGISTRY_KEY_PREFIX}*`;
-
-  do {
-    let res;
-    try {
-      res = await redisClient.scan(cursor, {
-        MATCH: match,
-        COUNT: 200,
-      });
-    } catch (err) {
-      if (isRedisNoAuthError(err)) {
-        await disableRoomRegistry(err);
-        return null;
-      }
-      throw err;
-    }
-    cursor = Number(res.cursor);
-    const keys = res.keys || [];
-    if (keys.length === 0) continue;
-
-    let values;
-    try {
-      values = await redisClient.mGet(keys);
-    } catch (err) {
-      if (isRedisNoAuthError(err)) {
-        await disableRoomRegistry(err);
-        return null;
-      }
-      throw err;
-    }
-    for (let i = 0; i < keys.length; i++) {
-      const key = keys[i];
-      const raw = values[i];
-      if (!raw) continue;
-
-      let rec;
-      try {
-        rec = JSON.parse(raw);
-      } catch {
-        continue;
-      }
-
-      const roomName =
-        rec.room_name || key.slice(ROOM_REGISTRY_KEY_PREFIX.length);
-      out[roomName] = {
-        room_name: roomName,
-        current: rec.current ?? 0,
-        max: rec.max ?? 0,
-        hasPassword: !!rec.hasPassword,
-        // Extra fields for clients that want multi-node redirect support.
-        nodeId: rec.nodeId,
-        url: rec.url,
-      };
-    }
-  } while (cursor !== 0);
-
-  return out;
+  if (!ENABLE_ROOM_REGISTRY) return null;
+  const out = await rommInternalRequest({
+    method: "GET",
+    path: "/api/sfu/internal/rooms/list",
+  });
+  return out || {};
 }
 
 async function refreshLocalRoomRegistry() {
-  if (!redisClient) return;
+  if (!ENABLE_ROOM_REGISTRY) return;
   for (const roomName of locallyHostedRooms) {
-    // If a room no longer exists locally, clean up its registry entry.
     if (!rooms.has(roomName)) {
       await registryDeleteRoom(roomName);
       locallyHostedRooms.delete(roomName);
@@ -505,14 +545,14 @@ const cors = require("cors");
 app.use(cors());
 
 // Simple HTTP endpoint used by clients to list available rooms.
-// Strict auth: must present a RoMM-issued JWT and its jti must exist in Redis.
-// If Redis registry is enabled, this is a cluster-wide list.
+// Strict auth: must present a RoMM-issued JWT and it must be allowlisted by RomM.
+// If the RomM room registry is enabled, this is a cluster-wide list.
 app.get("/list", async (req, res) => {
   try {
     const token = pickSfuAuthTokenFromHttp(req);
-    await verifySfuTokenAgainstRedis(token, { consume: false });
+    await verifySfuTokenViaRomm(token, { consume: false });
 
-    if (ENABLE_ROOM_REGISTRY && redisClient) {
+    if (ENABLE_ROOM_REGISTRY) {
       const out = (await registryListRooms()) || {};
       return res.json(out);
     }
@@ -529,7 +569,12 @@ app.get("/list", async (req, res) => {
     res.json(out);
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
-    if (msg.includes("not initialized") || msg.includes("missing")) {
+    if (
+      msg.includes("not initialized") ||
+      msg.includes("missing") ||
+      msg.includes("not configured") ||
+      msg.includes("timeout")
+    ) {
       return res.status(503).json({ error: "auth unavailable" });
     }
     return res.status(401).json({ error: "unauthorized" });
@@ -541,7 +586,7 @@ app.get("/list", async (req, res) => {
 app.get("/resolve", async (req, res) => {
   try {
     const token = pickSfuAuthTokenFromHttp(req);
-    await verifySfuTokenAgainstRedis(token, { consume: false });
+    await verifySfuTokenViaRomm(token, { consume: false });
 
     const roomName = String(req.query.room || req.query.room_name || "");
     if (!roomName) {
@@ -557,7 +602,7 @@ app.get("/resolve", async (req, res) => {
       });
     }
 
-    if (!ENABLE_ROOM_REGISTRY || !redisClient) {
+    if (!ENABLE_ROOM_REGISTRY) {
       return res.status(404).json({ error: "not found" });
     }
 
@@ -569,7 +614,40 @@ app.get("/resolve", async (req, res) => {
     return res.json({ room_name: roomName, url: rec.url, nodeId: rec.nodeId });
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
-    if (msg.includes("not initialized") || msg.includes("missing")) {
+    if (
+      msg.includes("not initialized") ||
+      msg.includes("missing") ||
+      msg.includes("not configured") ||
+      msg.includes("timeout")
+    ) {
+      return res.status(503).json({ error: "auth unavailable" });
+    }
+    return res.status(401).json({ error: "unauthorized" });
+  }
+});
+
+// Return the ICE server list this node is configured to use.
+// Auth matches /list and /resolve (RoMM-issued JWT verified via RomM internal API).
+// Clients may use this to prefer node-local TURN/STUN servers, then append any
+// local fallback list they have configured.
+app.get("/ice", async (req, res) => {
+  try {
+    const token = pickSfuAuthTokenFromHttp(req);
+    await verifySfuTokenViaRomm(token, { consume: false });
+
+    return res.json({
+      iceServers: SFU_ICE_SERVERS,
+      nodeId: NODE_ID,
+      url: PUBLIC_URL,
+    });
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    if (
+      msg.includes("not initialized") ||
+      msg.includes("missing") ||
+      msg.includes("not configured") ||
+      msg.includes("timeout")
+    ) {
       return res.status(503).json({ error: "auth unavailable" });
     }
     return res.status(401).json({ error: "unauthorized" });
@@ -578,14 +656,13 @@ app.get("/resolve", async (req, res) => {
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
-// --- SFU authentication (RoMM-issued JWT + Redis one-time JTI allowlist) ---
+// --- SFU authentication (RoMM-issued JWT + one-time JTI allowlist via RomM API) ---
 //
 // Flow:
 // 1) Client requests POST /api/sfu/token from RoMM and gets a short-lived JWT (30s) with jti.
 // 2) Client connects to SFU with that JWT (Socket.IO auth token).
-// 3) SFU verifies JWT signature + claims, then atomically consumes Redis key:
-//      sfu:auth:jti:<jti>  (HSET mapping, EX 30)
-//    If present, it deletes the key (one-time) and binds socket identity to sub.
+// 3) SFU calls back into RoMM (/api/sfu/internal/verify) which verifies the JWT signature,
+//    checks the Redis-backed allowlist, and optionally marks the token as used.
 
 const SFU_AUTH_ISSUER = process.env.SFU_AUTH_ISSUER || "romm:sfu";
 const SFU_AUTH_JTI_KEY_PREFIX =
@@ -629,82 +706,8 @@ const SFU_AUTH_TAKEOVER_GRACE_SECONDS = (() => {
 // mobile network transitions.
 const SFU_AUTH_TAKEOVER_MIN_INACTIVE_SECONDS = 1;
 
-const SFU_AUTH_SECRET =
-  process.env.ROMM_AUTH_SECRET_KEY || process.env.SFU_AUTH_SECRET_KEY || null;
-
-// SFU_AUTH_REDIS_URL can be set explicitly. If absent, we fall back to REDIS_URL.
-function buildRedisUrlFromParts(prefix) {
-  const host = (process.env[`${prefix}_HOST`] || "").trim();
-  if (!host) return null;
-
-  const portRaw = (process.env[`${prefix}_PORT`] || "6379").trim();
-  const dbRaw = (process.env[`${prefix}_DB`] || "0").trim();
-  let usernameRaw = (process.env[`${prefix}_USERNAME`] || "").trim();
-  let passwordRaw = process.env[`${prefix}_PASSWORD`] || "";
-
-  // Consistent naming: VALKEY_SFU_PASSWORD is preferred for the SFU auth Redis user.
-  // Backwards-compatible: still supports SFU_AUTH_REDIS_PASSWORD.
-  const usingValkeySfuPassword =
-    prefix === "SFU_AUTH_REDIS" &&
-    !passwordRaw &&
-    process.env.VALKEY_SFU_PASSWORD;
-  if (usingValkeySfuPassword) {
-    passwordRaw = process.env.VALKEY_SFU_PASSWORD || "";
-    // Only default the username when using the ACL-style VALKEY_SFU_PASSWORD.
-    // This avoids breaking classic requirepass setups that authenticate as the default user.
-    if (!usernameRaw) usernameRaw = "sfu";
-  }
-  const sslRaw = (process.env[`${prefix}_SSL`] || "").trim().toLowerCase();
-
-  const port = Number.parseInt(portRaw, 10);
-  if (!Number.isFinite(port)) {
-    throw new Error(
-      `${prefix}_PORT must be an integer, got ${JSON.stringify(portRaw)}`
-    );
-  }
-  const db = Number.parseInt(dbRaw, 10);
-  if (!Number.isFinite(db)) {
-    throw new Error(
-      `${prefix}_DB must be an integer, got ${JSON.stringify(dbRaw)}`
-    );
-  }
-
-  const scheme =
-    sslRaw === "1" || sslRaw === "true" || sslRaw === "yes" || sslRaw === "on"
-      ? "rediss:"
-      : "redis:";
-
-  // Treat the common requirepass setup as password-only (no explicit username).
-  const username = usernameRaw.toLowerCase() === "default" ? "" : usernameRaw;
-
-  const u = new URL(`${scheme}//${host}:${port}/${db}`);
-  if (username) u.username = username;
-  if (passwordRaw) u.password = passwordRaw;
-  return u.toString();
-}
-
-// Preferred: explicit URL.
-// Alternative: provide parts via SFU_AUTH_REDIS_* so passwords with special characters
-// do not require manual percent-encoding.
-const SFU_AUTH_REDIS_URL =
-  normalizeRedisUrl(process.env.SFU_AUTH_REDIS_URL) ||
-  buildRedisUrlFromParts("SFU_AUTH_REDIS") ||
-  normalizeRedisUrl(process.env.REDIS_URL) ||
-  null;
-
-let authRedisClient = null;
-const AUTH_USE_JTI_LUA =
-  // KEYS[1] = allowlist hash key, KEYS[2] = used marker key
-  // If allowlist key exists and used marker is not set, mark used and return hash.
-  // Do NOT delete allowlist key, so HTTP endpoints (e.g. /list) can still validate
-  // within the token TTL.
-  "local allow=KEYS[1] " +
-  "local used=KEYS[2] " +
-  "if redis.call('EXISTS', allow)==0 then return nil end " +
-  "if redis.call('SETNX', used, '1')==0 then return nil end " +
-  "local ttl=redis.call('TTL', allow) " +
-  "if ttl and tonumber(ttl) and tonumber(ttl) > 0 then redis.call('EXPIRE', used, ttl) end " +
-  "return redis.call('HGETALL', allow)";
+// Auth is verified by calling back into RomM (server-to-server), which checks
+// JWT signature + Redis-backed JTI allowlist.
 
 function pickSfuAuthTokenFromHttp(req) {
   if (!req) return null;
@@ -744,112 +747,18 @@ function pickSfuAuthTokenFromHttp(req) {
   return null;
 }
 
-async function verifySfuTokenAgainstRedis(token, { consume }) {
-  if (!SFU_AUTH_SECRET) {
-    throw new Error(
-      "auth secret missing (ROMM_AUTH_SECRET_KEY/SFU_AUTH_SECRET_KEY)"
-    );
-  }
-  if (!authRedisClient) {
-    throw new Error("auth redis not initialized");
-  }
-
-  const claims = verifyJwtHs256(token, SFU_AUTH_SECRET);
-  if (!claims || claims.iss !== SFU_AUTH_ISSUER) {
-    throw new Error("invalid issuer");
-  }
-  if (claims.type !== "sfu") {
-    throw new Error("invalid token type");
-  }
-  if (!claims.sub || typeof claims.sub !== "string") {
-    throw new Error("missing sub");
-  }
-  if (!claims.jti || typeof claims.jti !== "string") {
-    throw new Error("missing jti");
-  }
-
-  const allowKey = `${SFU_AUTH_JTI_KEY_PREFIX}${claims.jti}`;
-
-  let record;
-  if (consume) {
-    const usedKey = `${SFU_AUTH_JTI_KEY_PREFIX}used:${claims.jti}`;
-    const res = await authRedisClient.eval(AUTH_USE_JTI_LUA, {
-      keys: [allowKey, usedKey],
-      arguments: [],
-    });
-    if (!res) throw new Error("token not allowlisted");
-    record = hgetallArrayToObject(res);
-  } else {
-    record = await authRedisClient.hGetAll(allowKey);
-    if (!record || Object.keys(record).length === 0) {
-      throw new Error("token not allowlisted");
-    }
-  }
-
-  if (record.sub !== claims.sub) throw new Error("sub mismatch");
-  if (record.iss !== SFU_AUTH_ISSUER) throw new Error("iss mismatch");
-  if (record.jti !== claims.jti) throw new Error("jti mismatch");
-
-  return {
-    sub: claims.sub,
-    netplay_username: record.netplay_username || null,
-  };
-}
-
-function base64UrlToBuffer(input) {
-  // base64url -> base64
-  let s = String(input).replace(/-/g, "+").replace(/_/g, "/");
-  while (s.length % 4 !== 0) s += "=";
-  return Buffer.from(s, "base64");
-}
-
-function decodeJwtPart(part) {
-  const json = base64UrlToBuffer(part).toString("utf8");
-  return JSON.parse(json);
-}
-
-function verifyJwtHs256(token, secret) {
+async function verifySfuTokenViaRomm(token, { consume }) {
   if (!token || typeof token !== "string") throw new Error("missing token");
-  const parts = token.split(".");
-  if (parts.length !== 3) throw new Error("invalid jwt");
-
-  const [headerB64, payloadB64, sigB64] = parts;
-  const header = decodeJwtPart(headerB64);
-  if (!header || header.alg !== "HS256") throw new Error("unsupported jwt alg");
-
-  const data = `${headerB64}.${payloadB64}`;
-  const expectedSig = crypto
-    .createHmac("sha256", Buffer.from(String(secret), "utf8"))
-    .update(data)
-    .digest();
-  const actualSig = base64UrlToBuffer(sigB64);
-  if (
-    actualSig.length !== expectedSig.length ||
-    !crypto.timingSafeEqual(actualSig, expectedSig)
-  ) {
-    throw new Error("bad jwt signature");
-  }
-
-  const claims = decodeJwtPart(payloadB64);
-  const now = Math.floor(Date.now() / 1000);
-
-  if (claims && claims.nbf !== undefined) {
-    const nbf = Number(claims.nbf);
-    if (!Number.isFinite(nbf)) throw new Error("invalid nbf");
-    if (now + SFU_AUTH_CLOCK_SKEW_SECONDS < nbf)
-      throw new Error("jwt not active");
-  }
-
-  if (claims && claims.exp !== undefined) {
-    const exp = Number(claims.exp);
-    if (!Number.isFinite(exp)) throw new Error("invalid exp");
-    if (now - SFU_AUTH_CLOCK_SKEW_SECONDS >= exp)
-      throw new Error("jwt expired");
-  } else {
-    throw new Error("missing exp");
-  }
-
-  return claims;
+  const res = await rommInternalRequest({
+    method: "POST",
+    path: "/api/sfu/internal/verify",
+    body: { token, consume: !!consume },
+  });
+  if (!res || !res.sub) throw new Error("unauthorized");
+  return {
+    sub: res.sub,
+    netplay_username: res.netplay_username || null,
+  };
 }
 
 function pickSfuAuthTokenFromSocket(socket) {
@@ -901,36 +810,14 @@ function pickSfuAuthTokenFromSocket(socket) {
   return null;
 }
 
-function hgetallArrayToObject(arr) {
-  const out = {};
-  if (!Array.isArray(arr)) return out;
-  for (let i = 0; i + 1 < arr.length; i += 2) {
-    const k = String(arr[i]);
-    out[k] = String(arr[i + 1]);
-  }
-  return out;
-}
-
 async function initSfuAuth() {
-  if (!SFU_AUTH_SECRET) {
-    throw new Error(
-      "SFU_REQUIRE_AUTH is enabled but ROMM_AUTH_SECRET_KEY/SFU_AUTH_SECRET_KEY is not set"
-    );
+  if (!USE_ROMM_INTERNAL_API) {
+    throw new Error("SFU auth requires ROMM_API_BASE_URL (RomM internal API)");
   }
-
-  if (!SFU_AUTH_REDIS_URL) {
-    throw new Error(
-      "SFU_REQUIRE_AUTH is enabled but SFU_AUTH_REDIS_URL/REDIS_URL is not set"
-    );
+  if (!ROMM_SFU_INTERNAL_SECRET) {
+    throw new Error("SFU auth requires ROMM_SFU_INTERNAL_SECRET");
   }
-
-  const { createClient } = require("redis");
-  authRedisClient = createClient({ url: SFU_AUTH_REDIS_URL });
-  authRedisClient.on("error", (err) => {
-    logger.error("SFU auth redis error", err);
-  });
-  await authRedisClient.connect();
-  logger.info("SFU auth enabled", {
+  logger.info("SFU auth enabled (via RomM)", {
     issuer: SFU_AUTH_ISSUER,
     jtiPrefix: SFU_AUTH_JTI_KEY_PREFIX,
   });
@@ -939,7 +826,7 @@ async function initSfuAuth() {
 io.use(async (socket, next) => {
   try {
     const token = pickSfuAuthTokenFromSocket(socket);
-    const user = await verifySfuTokenAgainstRedis(token, { consume: true });
+    const user = await verifySfuTokenViaRomm(token, { consume: true });
     socket.data.sfuUser = user;
 
     return next();
@@ -1161,8 +1048,7 @@ io.on("connection", (socket) => {
         preferUdp: true,
         enableSctp: true,
         numSctpStreams: { OS: 1024, MIS: 1024 },
-        // STUN-only: configured via SFU_STUN_SERVERS/STUN_SERVERS.
-        // Example: SFU_STUN_SERVERS=stun.l.google.com:19302,stun1.example.com:3478
+        // ICE servers: STUN via SFU_STUN_SERVERS, TURN via SFU_TURN_SERVERS or SFU_TURN_SERVER1..4.
         iceServers: SFU_ICE_SERVERS,
       };
 
@@ -1692,7 +1578,7 @@ io.on("connection", (socket) => {
       const roomName = extra.room_name;
 
       // Multi-node: reject if the room exists on another node.
-      if (!rooms.has(roomName) && ENABLE_ROOM_REGISTRY && redisClient) {
+      if (!rooms.has(roomName) && ENABLE_ROOM_REGISTRY) {
         const existing = await registryResolveRoom(roomName);
         if (existing && existing.url && existing.url !== PUBLIC_URL) {
           return cb && cb("room exists");
@@ -1709,7 +1595,7 @@ io.on("connection", (socket) => {
       players.set(storedExtra.userid, storedExtra);
       rooms.set(roomName, { owner: socket.id, players, maxPlayers, password });
       locallyHostedRooms.add(roomName);
-      if (ENABLE_ROOM_REGISTRY && redisClient) {
+      if (ENABLE_ROOM_REGISTRY) {
         registryUpsertRoom(roomName).catch((e) => {
           logger.warn("failed to upsert room registry", e);
         });
@@ -1731,7 +1617,7 @@ io.on("connection", (socket) => {
       const roomName = extra.room_name;
 
       let room = rooms.get(roomName);
-      if (!room && ENABLE_ROOM_REGISTRY && redisClient) {
+      if (!room && ENABLE_ROOM_REGISTRY) {
         const resolved = await registryResolveRoom(roomName);
         if (resolved && resolved.url && resolved.url !== PUBLIC_URL) {
           // Inform clients that support multi-node redirects.
@@ -1839,7 +1725,7 @@ io.on("connection", (socket) => {
         socket.to(roomName).emit("room-player-joined", storedExtra);
       }
       io.to(roomName).emit("users-updated", listRoomUsers(roomName));
-      if (ENABLE_ROOM_REGISTRY && redisClient) {
+      if (ENABLE_ROOM_REGISTRY) {
         registryUpsertRoom(roomName).catch((e) => {
           logger.warn("failed to upsert room registry", e);
         });
@@ -1885,13 +1771,13 @@ io.on("connection", (socket) => {
       if (room.players.size === 0) {
         rooms.delete(roomName);
         locallyHostedRooms.delete(roomName);
-        if (ENABLE_ROOM_REGISTRY && redisClient) {
+        if (ENABLE_ROOM_REGISTRY) {
           registryDeleteRoom(roomName).catch((e) => {
             logger.warn("failed to delete room registry", e);
           });
         }
         logger.debug(`room ${roomName} deleted (empty)`);
-      } else if (ENABLE_ROOM_REGISTRY && redisClient) {
+      } else if (ENABLE_ROOM_REGISTRY) {
         registryUpsertRoom(roomName).catch((e) => {
           logger.warn("failed to upsert room registry", e);
         });
@@ -2079,7 +1965,7 @@ io.on("connection", (socket) => {
       if (room.owner === socket.id) {
         rooms.delete(roomName);
         locallyHostedRooms.delete(roomName);
-        if (ENABLE_ROOM_REGISTRY && redisClient) {
+        if (ENABLE_ROOM_REGISTRY) {
           registryDeleteRoom(roomName).catch((e) => {
             logger.warn("failed to delete room registry", e);
           });
@@ -2104,13 +1990,13 @@ io.on("connection", (socket) => {
         if (room.players.size === 0) {
           rooms.delete(roomName);
           locallyHostedRooms.delete(roomName);
-          if (ENABLE_ROOM_REGISTRY && redisClient) {
+          if (ENABLE_ROOM_REGISTRY) {
             registryDeleteRoom(roomName).catch((e) => {
               logger.warn("failed to delete room registry", e);
             });
           }
           logger.debug(`room ${roomName} deleted (empty)`);
-        } else if (ENABLE_ROOM_REGISTRY && redisClient) {
+        } else if (ENABLE_ROOM_REGISTRY) {
           registryUpsertRoom(roomName).catch((e) => {
             logger.warn("failed to upsert room registry", e);
           });

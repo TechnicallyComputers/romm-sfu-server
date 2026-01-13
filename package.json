@@ -10,7 +10,6 @@
     "express": "^4.18.2",
     "mediasoup": "^3.11.1",
     "puppeteer": "^24.34.0",
-    "redis": "^4.6.13",
     "socket.io": "^4.6.1",
     "socket.io-client": "^4.8.3"
   }
