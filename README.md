@@ -39,6 +39,10 @@ listening port. This lets you open a single UDP port in your firewall/NAT instea
 
 ## Environment variables
 
+**📖 For complete environment variable documentation, see [ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md)**
+
+Quick reference:
+
 - `USE_WEBRTC_SERVER` (default `1`): set to `0` to disable WebRtcServer and fall back to per-transport listen IPs.
 - `LISTEN_IP` (default `0.0.0.0`): bind address for WebRtcServer.
 - `ANNOUNCED_IP`: public IP/hostname to advertise in ICE candidates.
