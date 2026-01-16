@@ -872,6 +872,35 @@ function pickSfuAuthTokenFromSocket(socket) {
   return null;
 }
 
+// Decode JWT payload without verification (for checking token type)
+// This is safe because we only use it to check the 'type' claim after
+// the token has already been verified via RomM API.
+function decodeJwtPayload(token) {
+  if (!token || typeof token !== "string") return null;
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    // Decode base64url-encoded payload (second part)
+    const payload = parts[1];
+    // Replace URL-safe base64 characters
+    const base64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    // Add padding if needed
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    const decoded = Buffer.from(padded, "base64").toString("utf8");
+    return JSON.parse(decoded);
+  } catch {
+    return null;
+  }
+}
+
+// Require write token for room operations (create/join)
+function requireWriteToken(socket) {
+  const tokenType = socket.data?.sfuTokenType;
+  if (!tokenType || (tokenType !== "sfu:write" && tokenType !== "sfu")) {
+    throw new Error("write token required for room operations");
+  }
+}
+
 async function initSfuAuth() {
   if (!USE_ROMM_INTERNAL_API) {
     throw new Error("SFU auth requires ROMM_API_BASE_URL (RomM internal API)");
