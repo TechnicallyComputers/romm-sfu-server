@@ -130,6 +130,65 @@ This avoids spurious `userid in use` errors during fast network transitions.
   existing connection looks "stale" and the overlap is recent. This helps avoid surprise takeovers
   when the same account is used from another device. Set to `0` to remove the grace window.
 
+## JTI Token Implementation
+
+The SFU implements JWT ID (JTI) based authentication with RomM for secure netplay sessions.
+
+### Token Types
+
+- **Read Tokens** (`sfu:read`): 15-minute expiry for room listings and metadata access
+
+  - Validated via JWT signature only (no Redis storage)
+  - Used for non-destructive operations like viewing available rooms
+
+- **Write Tokens** (`sfu:write`): 30-second expiry for room creation and joining
+  - Stored in Redis as simple string markers for one-time use enforcement
+  - Required for room operations to prevent replay attacks
+
+### Redis Storage
+
+Write tokens are stored in Redis using `SET` with expiration:
+
+`SET sfu:auth:jti:<uuid> "0" EX 30`
+
+- **Key format**: `sfu:auth:jti:{jti}` where `{jti}` is the JWT ID claim
+- **Value**: Simple string `"0"` (marker for valid/unused token)
+- **Expiration**: 30 seconds for write tokens
+
+### Token Consumption
+
+When a write token is consumed (room creation/joining), it's deleted from Redis:
+
+// SFU calls RomM API with consume=true
+const result = await fetch('/api/sfu/internal/verify', {
+method: 'POST',
+body: JSON.stringify({ token, consume: true })
+});
+
+RomM then executes: DEL sfu:auth:jti:<uuid>
+If DEL returns 1: Token was valid and consumed
+If DEL returns 0: Token was already used or never existed
+
+### Security Benefits
+
+Replay Attack Prevention: Each write token can only be used once
+Short Expiration: Write tokens expire quickly to limit attack windows
+Atomic Operations: Redis DEL ensures race-condition-free consumption
+Stateless Verification: Read tokens validated purely by JWT signature
+
+### Error Handling
+
+The SFU handles authentication failures by triggering token refresh in the client:
+
+```
+// In room listing/joining error handlers
+if (window.handleSfuAuthError) {
+  window.handleSfuAuthError("read"); // or "write"
+}
+```
+
+This prompts the RomM frontend to request new tokens and update cookies automatically.
+
 ## RomM internal API auth
 
 The SFU talks to RomM using a shared secret header:

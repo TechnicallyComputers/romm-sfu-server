@@ -469,6 +469,15 @@ function rommInternalRequest({ method, path, body, timeoutMs = 5000 }) {
           const raw = Buffer.concat(chunks).toString("utf8");
           const code = res.statusCode || 0;
 
+          // Comment out successful API response logging to reduce log spam
+          // logger.debug("RomM API response", {
+          //   method,
+          //   path: url.pathname,
+          //   statusCode: code,
+          //   responseBody: raw.substring(0, 200) + (raw.length > 200 ? "..." : ""),
+          //   hasSecret: !!headers["x-romm-sfu-secret"]
+          // });
+
           if (code >= 400) {
             let detail = "";
             if (code === 403 && typeof raw === "string") {
@@ -536,9 +545,14 @@ async function registryUpsertRoom(roomName) {
 
   const record = {
     room_name: roomName,
-    current: room.players ? room.players.size : 0,
+    current: countActivePlayers(room),
     max: room.maxPlayers,
     hasPassword: !!room.password,
+    netplay_mode: room.netplay_mode || 0,
+    sync_config: room.sync_config || null,
+    spectator_mode: room.spectator_mode || 1,
+    rom_hash: room.rom_hash || null,
+    core_type: room.core_type || null,
     nodeId: NODE_ID,
     url: PUBLIC_URL,
     updatedAt: Date.now(),
@@ -600,6 +614,7 @@ async function refreshLocalRoomRegistry() {
 const app = express();
 const cors = require("cors");
 app.use(cors());
+app.use(express.json());
 
 // Simple HTTP endpoint used by clients to list available rooms.
 // Strict auth: must present a RoMM-issued JWT and it must be allowlisted by RomM.
@@ -615,17 +630,238 @@ app.get("/list", async (req, res) => {
     }
 
     const out = {};
+    const now = Date.now();
     for (const [name, info] of rooms.entries()) {
+      const webSocketPlayers = countActivePlayers(info);
+      const httpJoinedPlayers = info.joinedPlayers ? info.joinedPlayers.size : 0;
+      const currentPlayers = webSocketPlayers + httpJoinedPlayers;
+
+      // Skip empty rooms that are older than 5 minutes (unless HTTP-created and very recent)
+      const isEmpty = currentPlayers === 0;
+      const ageMinutes = (now - (info.created_at || 0)) / (1000 * 60);
+
+      if (isEmpty) {
+        // Keep HTTP-created rooms for 1 minute, WebSocket-created for 5 minutes
+        const keepMinutes = info.http_created ? 1 : 5;
+        if (ageMinutes > keepMinutes) {
+          console.log(`[HTTP] Skipping old empty room: ${name} (${ageMinutes.toFixed(1)} minutes old)`);
+          continue;
+        }
+      }
+
       out[name] = {
         room_name: name,
-        current: info.players.size,
+        current: currentPlayers,
         max: info.maxPlayers,
         hasPassword: !!info.password,
+        netplay_mode: info.netplay_mode || 0,
+        sync_config: info.sync_config || null,
+        spectator_mode: info.spectator_mode || 1,
+        rom_hash: info.rom_hash || null,
+        core_type: info.core_type || null,
       };
     }
     res.json(out);
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
+    if (
+      msg.includes("not initialized") ||
+      msg.includes("missing") ||
+      msg.includes("not configured") ||
+      msg.includes("timeout")
+    ) {
+      return res.status(503).json({ error: "auth unavailable" });
+    }
+    return res.status(401).json({ error: "unauthorized" });
+  }
+});
+
+// Create a new room via HTTP
+app.post("/create", async (req, res) => {
+  try {
+    const token = pickSfuAuthTokenFromHttp(req);
+    const authResult = await verifySfuTokenViaRomm(token, { consume: true });
+
+    const {
+      room_name,
+      max_players = 4,
+      password,
+      allow_spectators = true,
+      netplay_mode = 0,
+      sync_config = null,
+      spectator_mode = 1,
+      domain,
+      game_id,
+      rom_hash,
+      core_type
+    } = req.body;
+
+    if (!room_name) {
+      return res.status(400).json({ error: "room_name is required" });
+    }
+
+    if (rooms.has(room_name)) {
+      return res.status(409).json({ error: "room already exists" });
+    }
+
+    // Create room data structure similar to WebSocket room creation
+    const players = new Map();
+    const joinedPlayers = new Set();
+
+    // Add the room creator to joined players
+    if (authResult.netplay_username) {
+      joinedPlayers.add(authResult.netplay_username);
+    }
+
+    const roomData = {
+      owner: null, // HTTP-created rooms don't have an immediate owner socket
+      players,
+      joinedPlayers, // Track HTTP-joined players
+      maxPlayers: max_players,
+      password,
+      netplay_mode,
+      sync_config,
+      spectator_mode,
+      rom_hash,
+      core_type,
+      http_created: true, // Mark as HTTP-created
+      created_at: Date.now()
+    };
+
+    // Add lobby state for delay sync rooms
+    if (netplay_mode === 1) {
+      roomData.lobby_state = {
+        phase: 'waiting',
+        player_ready: new Map(),
+      };
+    }
+
+    rooms.set(room_name, roomData);
+    locallyHostedRooms.add(room_name);
+
+    // Room assignment: choose a worker using least-loaded strategy
+    await ensureRoomPrimaryAssigned(room_name);
+
+    console.log(`[HTTP] Room created: ${room_name} (${max_players} players, mode: ${netplay_mode}, core: ${core_type}, rom: ${rom_hash})`);
+
+    res.json({
+      room_id: room_name,
+      room: {
+        room_name,
+        current: joinedPlayers.size, // Creator is already joined
+        max: max_players,
+        hasPassword: !!password,
+        netplay_mode,
+        sync_config,
+        spectator_mode,
+        rom_hash,
+        core_type
+      }
+    });
+
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error("[HTTP] Room creation error:", msg);
+    if (
+      msg.includes("not initialized") ||
+      msg.includes("missing") ||
+      msg.includes("not configured") ||
+      msg.includes("timeout")
+    ) {
+      return res.status(503).json({ error: "auth unavailable" });
+    }
+    return res.status(401).json({ error: "unauthorized" });
+  }
+});
+
+// Join a room via HTTP
+app.post("/join/:roomId", async (req, res) => {
+  try {
+    const token = pickSfuAuthTokenFromHttp(req);
+    await verifySfuTokenViaRomm(token, { consume: false });
+
+    const { roomId } = req.params;
+    const { password, player_name, domain } = req.body;
+
+    if (!rooms.has(roomId)) {
+      return res.status(404).json({ error: "room not found" });
+    }
+
+    const room = rooms.get(roomId);
+
+    // Check password if required
+    if (room.password && room.password !== password) {
+      return res.status(403).json({ error: "incorrect password" });
+    }
+
+    // Check if room is full (count both HTTP-joined and WebSocket-connected players)
+    const totalJoinedPlayers = (room.joinedPlayers ? room.joinedPlayers.size : 0) + countActivePlayers(room);
+    if (totalJoinedPlayers >= room.maxPlayers) {
+      return res.status(409).json({ error: "room is full" });
+    }
+
+    // Track HTTP-joined players
+    if (!room.joinedPlayers) {
+      room.joinedPlayers = new Set();
+    }
+    room.joinedPlayers.add(player_name);
+
+    console.log(`[HTTP] Player ${player_name} joined room: ${roomId} (${room.joinedPlayers.size} HTTP joins, ${countActivePlayers(room)} WebSocket connections)`);
+
+    const webSocketPlayers = countActivePlayers(room);
+    const httpJoinedPlayers = room.joinedPlayers ? room.joinedPlayers.size : 0;
+
+    res.json({
+      room_id: roomId,
+      room: {
+        room_name: roomId,
+        current: webSocketPlayers + httpJoinedPlayers,
+        max: room.maxPlayers,
+        hasPassword: !!room.password,
+        netplay_mode: room.netplay_mode || 0,
+        sync_config: room.sync_config || null,
+        spectator_mode: room.spectator_mode || 1,
+        rom_hash: room.rom_hash || null,
+        core_type: room.core_type || null
+      }
+    });
+
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error("[HTTP] Room join error:", msg);
+    if (
+      msg.includes("not initialized") ||
+      msg.includes("missing") ||
+      msg.includes("not configured") ||
+      msg.includes("timeout")
+    ) {
+      return res.status(503).json({ error: "auth unavailable" });
+    }
+    return res.status(401).json({ error: "unauthorized" });
+  }
+});
+
+// Leave a room via HTTP
+app.post("/leave/:roomId", async (req, res) => {
+  try {
+    const token = pickSfuAuthTokenFromHttp(req);
+    await verifySfuTokenViaRomm(token, { consume: false });
+
+    const { roomId } = req.params;
+
+    if (!rooms.has(roomId)) {
+      return res.status(404).json({ error: "room not found" });
+    }
+
+    // Note: HTTP leave is more of a notification - actual cleanup happens via WebSocket
+    // This endpoint mainly serves to notify the server that a client is leaving
+    console.log(`[HTTP] Player left room: ${roomId}`);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error("[HTTP] Room leave error:", msg);
     if (
       msg.includes("not initialized") ||
       msg.includes("missing") ||
@@ -811,11 +1047,27 @@ function pickSfuAuthTokenFromHttp(req) {
 
 async function verifySfuTokenViaRomm(token, { consume }) {
   if (!token || typeof token !== "string") throw new Error("missing token");
+
+  // Comment out token verification logging to reduce log spam
+  // logger.debug("Verifying SFU token with RomM", {
+  //   tokenPrefix: token.substring(0, 20) + "...",
+  //   consume: !!consume
+  // });
+
   const res = await rommInternalRequest({
     method: "POST",
     path: "/api/sfu/internal/verify",
     body: { token, consume: !!consume },
   });
+
+  // Comment out token verification result logging to reduce log spam
+  // logger.debug("RomM token verification result", {
+  //   hasResponse: !!res,
+  //   hasSub: res && !!res.sub,
+  //   sub: res?.sub,
+  //   netplayUsername: res?.netplay_username
+  // });
+
   if (!res || !res.sub) throw new Error("unauthorized");
   return {
     sub: res.sub,
@@ -827,6 +1079,7 @@ function pickSfuAuthTokenFromSocket(socket) {
   // Preferred: Socket.IO auth payload.
   if (socket && socket.handshake && socket.handshake.auth) {
     const auth = socket.handshake.auth;
+    logger.debug("SFU auth - handshake.auth:", JSON.stringify(auth));
     if (typeof auth === "string") return auth;
     if (auth && typeof auth.token === "string") return auth.token;
   }
@@ -917,6 +1170,12 @@ async function initSfuAuth() {
 io.use(async (socket, next) => {
   try {
     const token = pickSfuAuthTokenFromSocket(socket);
+    logger.debug("SFU socket auth attempt", {
+      hasToken: !!token,
+      tokenPrefix: token ? token.substring(0, 20) + "..." : null,
+      socketId: socket.id
+    });
+
     const user = await verifySfuTokenViaRomm(token, { consume: true });
     socket.data.sfuUser = user;
 
@@ -925,6 +1184,8 @@ io.use(async (socket, next) => {
     logger.warn("SFU auth failed", {
       message: err && err.message ? err.message : String(err),
       ip: socket && socket.handshake ? socket.handshake.address : undefined,
+      statusCode: err.statusCode,
+      responseBody: err.body ? err.body.substring(0, 200) : undefined
     });
     return next(new Error("unauthorized"));
   }
@@ -1025,6 +1286,11 @@ async function ensureRoomPrimaryAssigned(roomName) {
 }
 
 function isViewerExtra(extra) {
+  // Check explicit spectator flag first
+  if (extra && extra.is_spectator === true) {
+    return true;
+  }
+
   // Heuristic: if player_slot is a valid controller slot, treat as a player.
   // Viewers typically won't set it.
   try {
@@ -1034,6 +1300,18 @@ function isViewerExtra(extra) {
     // ignore
   }
   return true;
+}
+
+function countActivePlayers(room) {
+  // Count players that are not spectators
+  if (!room || !room.players) return 0;
+  let count = 0;
+  for (const extra of room.players.values()) {
+    if (!isViewerExtra(extra)) {
+      count++;
+    }
+  }
+  return count;
 }
 
 function getPeerAssignedWorkerIdx(socketId, roomName) {
@@ -1749,7 +2027,7 @@ io.on("connection", (socket) => {
               });
               if (pipedId) idForTarget = pipedId;
             }
-            s.emit("new-producer", { id: idForTarget });
+            s.emit("new-producer", { id: idForTarget, kind: producer.kind });
           }
           logger.debug("broadcast new-producer to room", roomName, {
             producerId: producer.id,
@@ -1767,7 +2045,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on(
-    "sfu-produce-data",
+    "producedata",
     async (
       { transportId, sctpStreamParameters, label, protocol, appData },
       cb
@@ -1856,7 +2134,8 @@ io.on("connection", (socket) => {
         if (SFU_REQUIRE_BINARY_DATA_CHANNEL) {
           dataProducer.on("message", (message, ppid) => {
             try {
-              if (isBinaryDataChannelMessage(message, ppid)) return;
+              // Allow JSON protocol data channels (used by EmulatorJS for input relay)
+              if (dataProducer.protocol === "json" || isBinaryDataChannelMessage(message, ppid)) return;
 
               logger.warn("dataProducer sent non-binary message; closing", {
                 socket: socket.id,
@@ -1867,6 +2146,12 @@ io.on("connection", (socket) => {
                 messageType: typeof message,
               });
 
+              logger.error("Closing data producer due to non-binary message", {
+                dataProducerId: dataProducer.id,
+                socket: socket.id,
+                label: dataProducer.label,
+                protocol: dataProducer.protocol,
+              });
               try {
                 dataProducer.close();
               } catch {
@@ -1879,6 +2164,12 @@ io.on("connection", (socket) => {
         }
 
         dataProducer.on("transportclose", () => {
+          logger.warn("Data producer transport closed", {
+            dataProducerId: dataProducer.id,
+            socket: socket.id,
+            label: dataProducer.label,
+            protocol: dataProducer.protocol,
+          });
           try {
             peer.dataProducers.delete(dataProducer.id);
             dataProducerMeta.delete(dataProducer.id);
@@ -1895,8 +2186,24 @@ io.on("connection", (socket) => {
         if (roomName && rooms.has(roomName)) {
           try {
             const socketsInRoom = await io.in(roomName).fetchSockets();
+            logger.info("data producer created", {
+              producerSocketId: socket.id,
+              roomName,
+              dataProducerId: dataProducer.id,
+              label: dataProducer.label,
+              totalSocketsInRoom: socketsInRoom.length,
+              socketIdsInRoom: socketsInRoom.map(s => s.id),
+            });
+
             for (const s of socketsInRoom) {
-              if (!s || s.id === socket.id) continue;
+              if (!s || s.id === socket.id) {
+                logger.info("skipping socket for data producer broadcast", {
+                  skippedSocketId: s?.id,
+                  producerSocketId: socket.id,
+                  reason: s?.id === socket.id ? "same socket" : "invalid socket",
+                });
+                continue;
+              }
               const targetWorkerIdx = getPeerAssignedWorkerIdx(s.id, roomName);
               let idForTarget = dataProducer.id;
               if (
@@ -1913,11 +2220,20 @@ io.on("connection", (socket) => {
                 });
                 if (pipedId) idForTarget = pipedId;
               }
+              logger.info("emitting new-data-producer to socket", {
+                targetSocketId: s.id,
+                producerSocketId: socket.id,
+                dataProducerId: idForTarget,
+                roomName,
+                targetConnected: s.connected,
+              });
               s.emit("new-data-producer", { id: idForTarget });
             }
 
-            logger.debug("broadcast new-data-producer to room", roomName, {
+            logger.info("broadcast new-data-producer to room", roomName, {
               dataProducerId: dataProducer.id,
+              label: dataProducer.label,
+              sockets: socketsInRoom.length,
             });
           } catch (e) {
             logger.warn(
@@ -1993,7 +2309,7 @@ io.on("connection", (socket) => {
             }
           }
 
-          list.push({ id: outId });
+          list.push({ id: outId, kind: "data" });
         }
       }
 
@@ -2004,7 +2320,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("sfu-consume-data", async ({ dataProducerId, transportId }, cb) => {
+  socket.on("consumedata", async ({ dataProducerId, transportId }, cb) => {
     try {
       logger.debug("sfu-consume-data request from", socket.id, {
         dataProducerId,
@@ -2177,11 +2493,43 @@ io.on("connection", (socket) => {
         }
       }
 
+      console.log(`[SFU] sfu-get-producers: checking producers for sockets:`, Array.from(socketIds));
       for (const sid of socketIds) {
         const pinfo = peers.get(sid);
-        if (!pinfo || !pinfo.producers) continue;
+        if (!pinfo || !pinfo.producers) {
+          console.log(`[SFU] sfu-get-producers: no producers for socket ${sid}`);
+          continue;
+        }
+        console.log(`[SFU] sfu-get-producers: found ${pinfo.producers.size} producers for socket ${sid}`);
         for (const [pid] of pinfo.producers) {
+          console.log(`[SFU] sfu-get-producers: processing producer ${pid} from socket ${sid}`);
           let outId = pid;
+
+          // Check if piping is needed
+          const targetWorkerIdx = getPeerAssignedWorkerIdx(socket.id, roomName);
+          const sourceWorkerIdx = getPeerAssignedWorkerIdx(sid, roomName);
+          console.log(`[SFU] sfu-get-producers: producer ${pid} - source worker: ${sourceWorkerIdx}, target worker: ${targetWorkerIdx}`);
+
+          if (sourceWorkerIdx !== targetWorkerIdx) {
+            console.log(`[SFU] sfu-get-producers: attempting to pipe producer ${pid} from worker ${sourceWorkerIdx} to ${targetWorkerIdx}`);
+            try {
+              const pipedId = await ensurePipedProducerForWorker({
+                roomName,
+                sourceProducerId: pid,
+                targetWorkerIdx,
+              });
+              if (pipedId) {
+                console.log(`[SFU] sfu-get-producers: successfully piped ${pid} -> ${pipedId}`);
+                outId = pipedId;
+              } else {
+                console.log(`[SFU] sfu-get-producers: piping failed for ${pid}, using original ID`);
+              }
+            } catch (pipeError) {
+              console.error(`[SFU] sfu-get-producers: piping error for ${pid}:`, pipeError);
+            }
+          } else {
+            console.log(`[SFU] sfu-get-producers: no piping needed for ${pid} (same worker)`);
+          }
 
           if (SFU_FANOUT_ENABLED && workerPool.length > 1) {
             const targetWorkerIdx = getPeerAssignedWorkerIdx(
@@ -2221,10 +2569,11 @@ io.on("connection", (socket) => {
         }
       }
 
-      logger.debug("sfu-get-producers:", {
+      console.log("sfu-get-producers result:", {
         socket: socket.id,
         room: roomName,
         returned: list.length,
+        producers: list
       });
       cb && cb(null, list);
     } catch (e) {
@@ -2248,16 +2597,53 @@ io.on("connection", (socket) => {
         }
       }
 
-      if (rooms.has(roomName)) return cb && cb("room exists");
-      const players = new Map();
+      let room;
+      if (rooms.has(roomName)) {
+        // Allow joining existing HTTP-created rooms via Socket.IO open-room
+        room = rooms.get(roomName);
+        if (room && room.http_created) {
+          // Join existing HTTP-created room
+          console.log(`[SFU] Joining existing HTTP-created room: ${roomName}`);
+        } else {
+          return cb && cb("room exists");
+        }
+      } else {
+        // Create new room
+        room = {
+          owner: socket.id,
+          players: new Map(),
+          maxPlayers,
+          password,
+          netplay_mode: 0,
+          sync_config: null,
+          spectator_mode: 1,
+          rom_hash: null,
+          core_type: null,
+          lobby_state: null
+        };
+        rooms.set(roomName, room);
+        locallyHostedRooms.add(roomName);
+      }
+
       const storedExtra = applyAuthToExtra(normalizeExtra(extra));
 
       // Bind this socket to its claimed userid once, server-side.
       bindUseridToSocket(storedExtra.userid);
 
-      players.set(storedExtra.userid, storedExtra);
-      rooms.set(roomName, { owner: socket.id, players, maxPlayers, password });
-      locallyHostedRooms.add(roomName);
+      // Add player to room (or update if already exists)
+      room.players.set(storedExtra.userid, storedExtra);
+
+      // Set as owner if room doesn't have one (HTTP-created rooms start with null owner)
+      if (!room.owner) {
+        room.owner = socket.id;
+      }
+
+      // Update room metadata from extra data
+      if (storedExtra.netplay_mode !== undefined) room.netplay_mode = storedExtra.netplay_mode;
+      if (storedExtra.sync_config !== undefined) room.sync_config = storedExtra.sync_config;
+      if (storedExtra.spectator_mode !== undefined) room.spectator_mode = storedExtra.spectator_mode;
+      if (storedExtra.rom_hash !== undefined) room.rom_hash = storedExtra.rom_hash;
+      if (storedExtra.core_type !== undefined) room.core_type = storedExtra.core_type;
 
       // Room assignment: choose a worker using least-loaded strategy and
       // create a dedicated router for this room on that worker.
@@ -2283,7 +2669,9 @@ io.on("connection", (socket) => {
       }
       socket.join(roomName);
       logger.debug(`room opened: ${roomName} by ${socket.id}`);
-      io.to(roomName).emit("users-updated", listRoomUsers(roomName));
+      const roomUsers = listRoomUsers(roomName);
+      logger.debug("sending users-updated to room (open-room)", { roomName, userCount: Object.keys(roomUsers).length, users: roomUsers });
+      io.to(roomName).emit("users-updated", roomUsers);
       cb && cb(null);
     } catch (err) {
       console.error("open-room error", err);
@@ -2292,10 +2680,20 @@ io.on("connection", (socket) => {
   });
 
   socket.on("join-room", async (data, cb) => {
+    console.log(`[SFU] join-room event received from ${socket.id}:`, {
+      roomName: data?.extra?.room_name,
+      playerName: data?.extra?.player_name,
+      playerId: data?.extra?.userid
+    });
+
     try {
       const { extra, password = "" } = data || {};
-      if (!extra || !extra.room_name) return cb && cb("invalid");
+      if (!extra || !extra.room_name) {
+        console.log("[SFU] join-room: invalid data, missing extra or room_name");
+        return cb && cb("invalid");
+      }
       const roomName = extra.room_name;
+      console.log(`[SFU] Processing join-room for ${roomName}`);
 
       let room = rooms.get(roomName);
       if (!room && ENABLE_ROOM_REGISTRY) {
@@ -2317,6 +2715,17 @@ io.on("connection", (socket) => {
               nodeId: resolved.nodeId,
             })
           );
+        } else if (resolved && resolved.url === PUBLIC_URL && resolved.nodeId === NODE_ID) {
+          // Room exists in registry for this node but is missing from memory (e.g., after SFU restart).
+          // Clean up the stale registry entry since the room no longer exists.
+          logger.warn("Cleaning up stale room registry entry", {
+            roomName,
+            nodeId: resolved.nodeId,
+          });
+          await registryDeleteRoom(roomName).catch((e) => {
+            logger.warn("Failed to clean up stale room registry", e);
+          });
+          return cb && cb("no such room");
         }
       }
 
@@ -2325,6 +2734,38 @@ io.on("connection", (socket) => {
       if (room.password && room.password !== password)
         return cb && cb("bad password");
       const storedExtra = applyAuthToExtra(normalizeExtra(extra));
+
+      // Validate ROM and core compatibility for player join
+      const isSpectatorJoin = storedExtra.is_spectator || false;
+      if (!isSpectatorJoin && room.rom_hash && room.core_type) {
+        // Check if joining client has compatible ROM and core
+        const clientRomHash = storedExtra.rom_hash;
+        const clientCoreType = storedExtra.core_type;
+
+        const romMatch = !clientRomHash || clientRomHash === room.rom_hash;
+        const coreMatch = !clientCoreType || clientCoreType === room.core_type;
+
+        if (!romMatch || !coreMatch) {
+          // ROM/Core mismatch - check if spectators are allowed
+          if (room.spectator_mode === 1) {
+            // Spectators allowed - suggest joining as spectator
+            return cb && cb({
+              error: "incompatible_game",
+              message: "ROM or emulator core doesn't match room requirements",
+              canJoinAsSpectator: true,
+              requiredRomHash: room.rom_hash,
+              requiredCoreType: room.core_type
+            });
+          } else {
+            // Spectators not allowed - reject join
+            return cb && cb({
+              error: "incompatible_game",
+              message: "ROM or emulator core doesn't match room requirements and spectators are not allowed",
+              canJoinAsSpectator: false
+            });
+          }
+        }
+      }
 
       // Bind this socket to its claimed userid once, server-side.
       bindUseridToSocket(storedExtra.userid);
@@ -2336,6 +2777,13 @@ io.on("connection", (socket) => {
       const existingExtra = isReconnect
         ? room.players.get(storedExtra.userid)
         : null;
+
+      // Check room capacity for active players only (exclude spectators)
+      const activePlayerCount = countActivePlayers(room);
+      const isSpectator = isViewerExtra(storedExtra);
+      if (!isReconnect && !isSpectator && activePlayerCount >= room.maxPlayers) {
+        return cb && cb("room full");
+      }
       const existingSid =
         existingExtra && (existingExtra.socketId || existingExtra.socket_id);
       const existingSockAlive =
@@ -2460,14 +2908,30 @@ io.on("connection", (socket) => {
       if (!isReconnect) {
         socket.to(roomName).emit("room-player-joined", storedExtra);
       }
-      io.to(roomName).emit("users-updated", listRoomUsers(roomName));
+      const roomUsers = listRoomUsers(roomName);
+      logger.debug("sending users-updated to room", { roomName, userCount: Object.keys(roomUsers).length, users: roomUsers });
+      io.to(roomName).emit("users-updated", roomUsers);
       if (ENABLE_ROOM_REGISTRY) {
         registryUpsertRoom(roomName).catch((e) => {
           logger.warn("failed to upsert room registry", e);
         });
       }
       logger.debug(`socket ${socket.id} joined room ${roomName}`);
-      cb && cb(null, listRoomUsers(roomName));
+      const response = {
+        users: roomUsers,
+        netplay_mode: room.netplay_mode || 0,
+        sync_config: room.sync_config || null,
+      };
+
+      // Include lobby state for delay sync rooms
+      if (room.lobby_state) {
+        response.lobby_state = {
+          phase: room.lobby_state.phase,
+          player_ready: Object.fromEntries(room.lobby_state.player_ready)
+        };
+      }
+
+      cb && cb(null, response);
     } catch (err) {
       console.error("join-room error", err);
       cb && cb(err.message || "error");
@@ -2522,7 +2986,9 @@ io.on("connection", (socket) => {
       room.players.delete(useridToRemove);
       socket.leave(roomName);
       socket.to(roomName).emit("room-player-left", { userid: useridToRemove });
-      io.to(roomName).emit("users-updated", listRoomUsers(roomName));
+      const roomUsers = listRoomUsers(roomName);
+      logger.debug("sending users-updated to room (leave-room)", { roomName, userCount: Object.keys(roomUsers).length, users: roomUsers });
+      io.to(roomName).emit("users-updated", roomUsers);
       if (room.players.size === 0) {
         rooms.delete(roomName);
         locallyHostedRooms.delete(roomName);
@@ -2541,6 +3007,170 @@ io.on("connection", (socket) => {
       cb && cb(null);
     } catch (err) {
       console.error("leave-room error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  // Lobby management for delay sync rooms
+  socket.on("player-ready", (data, cb) => {
+    try {
+      const { roomName } = data || {};
+      const room = rooms.get(roomName);
+      if (!room || !room.lobby_state) return cb && cb("not a delay sync room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      const playerExtra = room.players.get(assignedUserid);
+      if (!playerExtra || isViewerExtra(playerExtra)) {
+        return cb && cb("spectators cannot participate in lobby");
+      }
+
+      room.lobby_state.player_ready.set(assignedUserid, true);
+
+      // Check if all active players are ready
+      const activePlayers = Array.from(room.players.values()).filter(p => !isViewerExtra(p));
+      const allReady = activePlayers.every(p => room.lobby_state.player_ready.get(p.userid));
+
+      if (allReady && room.lobby_state.phase === 'waiting') {
+        room.lobby_state.phase = 'ready';
+      }
+
+      // Broadcast lobby state update
+      io.to(roomName).emit("lobby-state", {
+        phase: room.lobby_state.phase,
+        player_ready: Object.fromEntries(room.lobby_state.player_ready)
+      });
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("player-ready error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  socket.on("player-unready", (data, cb) => {
+    try {
+      const { roomName } = data || {};
+      const room = rooms.get(roomName);
+      if (!room || !room.lobby_state) return cb && cb("not a delay sync room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      room.lobby_state.player_ready.set(assignedUserid, false);
+
+      if (room.lobby_state.phase === 'ready') {
+        room.lobby_state.phase = 'waiting';
+      }
+
+      // Broadcast lobby state update
+      io.to(roomName).emit("lobby-state", {
+        phase: room.lobby_state.phase,
+        player_ready: Object.fromEntries(room.lobby_state.player_ready)
+      });
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("player-unready error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  socket.on("launch-game", (data, cb) => {
+    try {
+      const { roomName } = data || {};
+      const room = rooms.get(roomName);
+      if (!room || !room.lobby_state) return cb && cb("not a delay sync room");
+
+      // Only owner can launch
+      if (room.owner !== socket.id) return cb && cb("not room owner");
+
+      // Must be in ready state
+      if (room.lobby_state.phase !== 'ready') return cb && cb("not all players ready");
+
+      room.lobby_state.phase = 'launching';
+
+      // Broadcast launch command
+      io.to(roomName).emit("game-launch", {
+        seed: Date.now(), // Simple seed based on timestamp
+        delay: room.sync_config?.frameDelay || 2,
+        start_frame: 1
+      });
+
+      room.lobby_state.phase = 'started';
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("launch-game error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  // Player slot updates for delay sync rooms
+  socket.on("update-player-slot", (data, cb) => {
+    try {
+      const { roomName, playerSlot } = data || {};
+      const room = rooms.get(roomName);
+      if (!room) return cb && cb("no such room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      // Update player's slot
+      const playerExtra = room.players.get(assignedUserid);
+      if (playerExtra) {
+        playerExtra.player_slot = playerSlot;
+
+        // Broadcast slot update to all players in room
+        io.to(roomName).emit("player-slot-updated", {
+          playerId: assignedUserid,
+          playerSlot: playerSlot
+        });
+      }
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("update-player-slot error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  // Deterministic preload sequence for delay sync rooms
+  socket.on("ready-at-frame-1", (data, cb) => {
+    try {
+      const { roomName, frame } = data || {};
+      const room = rooms.get(roomName);
+      if (!room || !room.lobby_state || room.lobby_state.phase !== 'launching') {
+        return cb && cb("not launching");
+      }
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      // Track ready status for deterministic start
+      if (!room.lobby_state.ready_at_frame_1) {
+        room.lobby_state.ready_at_frame_1 = new Map();
+      }
+      room.lobby_state.ready_at_frame_1.set(assignedUserid, true);
+
+      // Check if all active players are ready
+      const activePlayers = Array.from(room.players.values()).filter(p => !isViewerExtra(p));
+      const allReady = activePlayers.every(p => room.lobby_state.ready_at_frame_1.get(p.userid));
+
+      if (allReady) {
+        // All players ready - send START signal
+        const startTime = Date.now() + 100; // Start in 100ms
+        io.to(roomName).emit("start-game", {
+          frame: frame,
+          start_time: startTime
+        });
+        console.log(`[SFU] All players ready at frame ${frame}, starting game at ${startTime}`);
+      }
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("ready-at-frame-1 error", err);
       cb && cb(err.message || "error");
     }
   });
@@ -2641,11 +3271,8 @@ io.on("connection", (socket) => {
   socket.on(
     "sfu-consume",
     async ({ producerId, transportId, rtpCapabilities }, cb) => {
+      console.log(`[SFU] sfu-consume request from ${socket.id}: producerId=${producerId}, transportId=${transportId}`);
       try {
-        logger.debug("sfu-consume request from", socket.id, {
-          producerId,
-          transportId,
-        });
 
         const roomName = getSocketRoomName();
         if (!roomName) throw new Error("no room");
@@ -2738,11 +3365,26 @@ io.on("connection", (socket) => {
         const transportOwner = peer.transports.get(transportId);
         if (!transportOwner) throw new Error("transport not found");
 
-        const consumer = await transportOwner.consume({
-          producerId: effectiveProducerId,
-          rtpCapabilities,
-          paused: false,
-        });
+        console.log(`[SFU] Attempting to consume producer ${effectiveProducerId} on transport ${transportId}`);
+      console.log(`[SFU] Consumer router instance:`, consumerRouter);
+      console.log(`[SFU] Transport router:`, transportOwner.router ? 'same router' : 'different router');
+
+      // Check if producer exists on router
+      try {
+        const producers = consumerRouter.producers;
+        console.log(`[SFU] Router has ${producers.size} producers`);
+        const producerExists = Array.from(producers.keys()).includes(effectiveProducerId);
+        console.log(`[SFU] Producer ${effectiveProducerId} exists on router: ${producerExists}`);
+      } catch (e) {
+        console.log(`[SFU] Error checking producers:`, e.message);
+      }
+
+      const consumer = await transportOwner.consume({
+        producerId: effectiveProducerId,
+        rtpCapabilities,
+        paused: false,
+      });
+      console.log(`[SFU] Successfully created consumer ${consumer.id} for producer ${effectiveProducerId}`);
 
         peer.consumers.set(consumer.id, consumer);
 
@@ -2797,6 +3439,25 @@ io.on("connection", (socket) => {
     }
   );
 
+  socket.on("data-message", (data) => {
+    const roomName = getSocketRoomName();
+    if (roomName && rooms.has(roomName)) {
+      logger.debug("broadcasting data-message to room", {
+        fromSocket: socket.id,
+        roomName,
+        dataKeys: Object.keys(data || {}),
+      });
+      // Broadcast to all other sockets in the room
+      socket.to(roomName).emit("data-message", data);
+    } else {
+      logger.warn("data-message received but no room found", {
+        socket: socket.id,
+        roomName,
+        hasRoom: rooms.has(roomName || ""),
+      });
+    }
+  });
+
   socket.on("disconnect", (reason) => {
     logger.debug("client disconnected", socket.id, { reason });
 
@@ -2842,7 +3503,9 @@ io.on("connection", (socket) => {
       }
       if (removedUserid) {
         io.to(roomName).emit("room-player-left", { userid: removedUserid });
-        io.to(roomName).emit("users-updated", listRoomUsers(roomName));
+        const roomUsers = listRoomUsers(roomName);
+        logger.debug("sending users-updated to room (disconnect)", { roomName, userCount: Object.keys(roomUsers).length, users: roomUsers });
+        io.to(roomName).emit("users-updated", roomUsers);
         if (room.players.size === 0) {
           rooms.delete(roomName);
           locallyHostedRooms.delete(roomName);
@@ -2916,6 +3579,32 @@ runMediasoup()
         res.status(500).json({ error: err.message });
       }
     });
+
+    // Periodic cleanup of old empty rooms
+    setInterval(() => {
+      const now = Date.now();
+      const toDelete = [];
+
+      for (const [roomName, room] of rooms.entries()) {
+        const currentPlayers = countActivePlayers(room);
+        if (currentPlayers === 0) {
+          const ageMinutes = (now - (room.created_at || 0)) / (1000 * 60);
+
+          // Delete HTTP-created rooms after 2 minutes, WebSocket-created after 10 minutes
+          const deleteMinutes = room.http_created ? 2 : 10;
+
+          if (ageMinutes > deleteMinutes) {
+            console.log(`[Cleanup] Deleting old empty room: ${roomName} (${ageMinutes.toFixed(1)} minutes old)`);
+            toDelete.push(roomName);
+          }
+        }
+      }
+
+      for (const roomName of toDelete) {
+        cleanupRoomMediasoup(roomName);
+        locallyHostedRooms.delete(roomName);
+      }
+    }, 60000); // Check every minute
 
     server.listen(PORT, "0.0.0.0", () =>
       logger.info(`SFU server listening on port ${PORT} (bound to 0.0.0.0)`)

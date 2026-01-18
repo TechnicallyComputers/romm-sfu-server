@@ -10,17 +10,23 @@ WORKDIR /app
 ARG PUPPETEER_SKIP_DOWNLOAD=1
 ENV PUPPETEER_SKIP_DOWNLOAD=${PUPPETEER_SKIP_DOWNLOAD}
 
-# Install toolchain for native deps
+# Install toolchain for native deps (including pip for mediasoup)
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     python3 \
+    python3-pip \
     make \
     g++ \
     pkg-config \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+
+# Pre-install mediasoup to avoid network issues during build
+RUN npm ci --omit=dev || ( \
+  echo "npm ci failed, trying with network access..." && \
+  npm ci --omit=dev --fetch-timeout=60000 \
+)
 
 COPY . .
 
