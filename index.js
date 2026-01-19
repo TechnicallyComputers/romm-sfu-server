@@ -1644,11 +1644,11 @@ io.on("connection", (socket) => {
     peer.userid = userid;
   };
 
+  const sfuUser = socket.data && socket.data.sfuUser;
   // If SFU auth is enabled, bind the authenticated userid immediately.
   try {
     if (SFU_REQUIRE_AUTH) {
-      const sfuUser = socket.data && socket.data.sfuUser;
-      if (!sfuUser || !sfuUser.sub) throw new Error("unauthorized");
+      // Still store the display name separately if available.
       bindUseridToSocket(sfuUser.sub);
     }
   } catch (e) {
@@ -1681,15 +1681,18 @@ io.on("connection", (socket) => {
         }
       );
     }
-
-    storedExtra.userid = assignedUserid;
-
-    const sfuUser = socket.data && socket.data.sfuUser;
+    // Backup the original netplay username if we apply rewriting.
+    // Example, if enforcing server side censorship on federated netplay.
+    // This way we can identify users on server, but censor for clients.
     if (sfuUser && sfuUser.netplay_username) {
       storedExtra.netplay_username = sfuUser.netplay_username;
-      if (!storedExtra.player_name)
-        storedExtra.player_name = sfuUser.netplay_username;
     }
+    storedExtra.userid = assignedUserid;
+
+    // We use player_name as single source of truth for client software
+    // netplay_username is only used for server side identification.
+    // This allows server side identification, but censor for clients.
+    storedExtra.player_name = assignedUserid;
 
     return storedExtra;
   };
