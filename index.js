@@ -2568,9 +2568,17 @@ io.on("connection", (socket) => {
             }
           }
 
-          list.push({ id: outId });
-        }
-      }
+          // Include producer metadata for proper client handling
+          const producer = pinfo.producers.get(pid); // Get the actual producer object
+          const meta = producerMeta.get(pid); // Get producer metadata
+          const producerKind = meta ? meta.kind : (producer ? producer.kind : 'unknown');
+
+          list.push({
+            id: outId,
+            kind: producerKind
+          });
+        } // Close inner for loop
+      } // Close outer for loop
 
       console.log("sfu-get-producers result:", {
         socket: socket.id,
@@ -3273,7 +3281,7 @@ io.on("connection", (socket) => {
 
   socket.on(
     "sfu-consume",
-    async ({ producerId, transportId, rtpCapabilities }, cb) => {
+    async ({ producerId, transportId, rtpCapabilities, ignoreDtx }, cb) => {
       console.log(`[SFU] sfu-consume request from ${socket.id}: producerId=${producerId}, transportId=${transportId}`);
       try {
 
@@ -3382,10 +3390,34 @@ io.on("connection", (socket) => {
         console.log(`[SFU] Error checking producers:`, e.message);
       }
 
+      // Determine if this is an audio consumer to apply ignoreDtx
+      // Check producer metadata or get producer from router to determine kind
+      let isAudioConsumer = false;
+      if (ignoreDtx !== undefined) {
+        isAudioConsumer = ignoreDtx;
+      } else {
+        // Fallback: check producer metadata or producer object
+        const meta = producerMeta.get(effectiveProducerId);
+        if (meta && meta.kind === 'audio') {
+          isAudioConsumer = true;
+        } else {
+          // Try to get producer from router
+          try {
+            const producer = consumerRouter.producers.get(effectiveProducerId);
+            if (producer && producer.kind === 'audio') {
+              isAudioConsumer = true;
+            }
+          } catch (e) {
+            // Ignore errors, default to false
+          }
+        }
+      }
+
       const consumer = await transportOwner.consume({
         producerId: effectiveProducerId,
         rtpCapabilities,
         paused: false,
+        ignoreDtx: isAudioConsumer, // Ignore DTX for audio consumers to prevent sync drift
       });
       console.log(`[SFU] Successfully created consumer ${consumer.id} for producer ${effectiveProducerId}`);
 
