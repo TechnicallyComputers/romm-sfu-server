@@ -1213,7 +1213,16 @@ const producerMeta = new Map(); // producerId -> { roomName, workerIdx, socketId
 const dataProducerMeta = new Map(); // dataProducerId -> { roomName, workerIdx, socketId, label, protocol }
 
 const mediaCodecs = [
-  { mimeType: "audio/opus", clockRate: 48000, channels: 2 },
+  {
+    kind: "audio",
+    mimeType: "audio/opus",
+    clockRate: 48000,
+    channels: 2,
+    parameters: {
+      useinbandfec: 1,
+      stereo: 1
+    }
+  },
   // Codec order matters for client Auto preference.
   // Present VP9 first, then H264, then VP8.
   { mimeType: "video/VP9", clockRate: 90000 },
