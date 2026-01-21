@@ -270,8 +270,18 @@ function parseStunServersFromEnv() {
     ""
   ).trim();
 
+  logger.warn("SFU_STUN_SERVERS environment variable:", {
+    SFU_STUN_SERVERS: process.env.SFU_STUN_SERVERS,
+    STUN_SERVERS: process.env.STUN_SERVERS,
+    raw: raw,
+    rawLength: raw.length
+  });
+
   // Keep a sane default when unset.
-  if (!raw) return [{ urls: "stun:stun.l.google.com:19302" }];
+  if (!raw) {
+    logger.warn("No SFU_STUN_SERVERS configured, using default Google STUN");
+    return [{ urls: "stun:stun.l.google.com:19302" }];
+  }
 
   const out = [];
   for (const token of splitServerTokens(raw)) {
@@ -725,7 +735,8 @@ app.post("/create", async (req, res) => {
       rom_hash,
       core_type,
       http_created: true, // Mark as HTTP-created
-      created_at: Date.now()
+      created_at: Date.now(),
+      chatHistory: []
     };
 
     // Add lobby state for delay sync rooms
@@ -928,10 +939,17 @@ app.get("/ice", async (req, res) => {
     const token = pickSfuAuthTokenFromHttp(req);
     await verifySfuTokenViaRomm(token, { consume: false });
 
+    logger.warn("/ice endpoint called, returning ICE servers:", {
+      iceServers: SFU_ICE_SERVERS,
+      iceServerCount: SFU_ICE_SERVERS.length,
+      nodeId: NODE_ID
+    });
+
     return res.json({
       iceServers: SFU_ICE_SERVERS,
       nodeId: NODE_ID,
       url: PUBLIC_URL,
+      announcedIp: process.env.ANNOUNCED_IP || null,
     });
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
@@ -2639,7 +2657,8 @@ io.on("connection", (socket) => {
           spectator_mode: 1,
           rom_hash: null,
           core_type: null,
-          lobby_state: null
+          lobby_state: null,
+          chatHistory: []
         };
         rooms.set(roomName, room);
         locallyHostedRooms.add(roomName);
@@ -3259,12 +3278,17 @@ io.on("connection", (socket) => {
       if (typeof target === "string" && io.sockets.sockets.get(target)) {
         targetSocketId = target;
       } else if (roomName) {
-        // Fallback: treat target as a userid and resolve to socketId.
         const room = rooms.get(roomName);
-        const extra = room && room.players.get(target);
-        const resolved = extra && (extra.socketId || extra.socket_id);
-        if (resolved && io.sockets.sockets.get(resolved)) {
-          targetSocketId = resolved;
+        if (target === "host") {
+          // Special case: "host" resolves to the room owner
+          targetSocketId = room && room.owner;
+        } else {
+          // Fallback: treat target as a userid and resolve to socketId.
+          const extra = room && room.players.get(target);
+          const resolved = extra && (extra.socketId || extra.socket_id);
+          if (resolved && io.sockets.sockets.get(resolved)) {
+            targetSocketId = resolved;
+          }
         }
       }
 
@@ -3495,6 +3519,81 @@ io.on("connection", (socket) => {
       socket.to(roomName).emit("data-message", data);
     } else {
       logger.warn("data-message received but no room found", {
+        socket: socket.id,
+        roomName,
+        hasRoom: rooms.has(roomName || ""),
+      });
+    }
+  });
+
+  socket.on("chat-message", (data) => {
+    const roomName = getSocketRoomName();
+    if (roomName && rooms.has(roomName)) {
+      const room = rooms.get(roomName);
+      const peer = peers.get(socket.id);
+
+      if (!peer || !peer.userid) {
+        logger.warn("chat-message received but no peer/userid found", {
+          socket: socket.id,
+          roomName,
+        });
+        return;
+      }
+
+      // Extract player name from room data
+      const playerData = room.players.get(peer.userid);
+      const playerName = playerData?.player_name || peer.userid || "Unknown";
+
+      // Validate message
+      if (!data || !data.message || typeof data.message !== 'string') {
+        logger.warn("chat-message received with invalid data", {
+          socket: socket.id,
+          roomName,
+          data,
+        });
+        return;
+      }
+
+      // Trim and limit message length
+      const message = data.message.trim();
+      if (message.length === 0 || message.length > 500) {
+        logger.warn("chat-message rejected: empty or too long", {
+          socket: socket.id,
+          roomName,
+          length: message.length,
+        });
+        return;
+      }
+
+      // Create chat message object
+      const chatMessage = {
+        userid: peer.userid,
+        playerName: playerName,
+        message: message,
+        timestamp: Date.now(),
+        messageId: `${peer.userid}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+      };
+
+      // Store in room's chat history (limit to 100 messages)
+      if (!room.chatHistory) {
+        room.chatHistory = [];
+      }
+      room.chatHistory.push(chatMessage);
+      if (room.chatHistory.length > 100) {
+        room.chatHistory = room.chatHistory.slice(-100);
+      }
+
+      logger.debug("broadcasting chat-message to room", {
+        fromSocket: socket.id,
+        roomName,
+        playerName,
+        messageLength: message.length,
+      });
+
+      // Broadcast to all sockets in the room (including sender)
+      io.to(roomName).emit("chat-message", chatMessage);
+    } else {
+      logger.warn("chat-message received but no room found", {
         socket: socket.id,
         roomName,
         hasRoom: rooms.has(roomName || ""),
