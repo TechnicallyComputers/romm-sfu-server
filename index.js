@@ -94,12 +94,12 @@ const ANNOUNCED_ADDRESS = process.env.ANNOUNCED_IP || null;
 const WEBRTC_PORT = Number.parseInt(process.env.WEBRTC_PORT || "20000", 10);
 const WEBRTC_UDP_PORT = Number.parseInt(
   process.env.WEBRTC_UDP_PORT || String(WEBRTC_PORT),
-  10
+  10,
 );
 const ENABLE_WEBRTC_TCP = process.env.ENABLE_WEBRTC_TCP !== "0";
 const WEBRTC_TCP_PORT = Number.parseInt(
   process.env.WEBRTC_TCP_PORT || String(WEBRTC_PORT),
-  10
+  10,
 );
 
 // Worker scaling
@@ -108,7 +108,7 @@ const WEBRTC_TCP_PORT = Number.parseInt(
 // - Caps to available logical cores to prevent accidental oversubscription.
 const SFU_WORKER_COUNT_RAW = Number.parseInt(
   process.env.SFU_WORKER_COUNT || "1",
-  10
+  10,
 );
 const SFU_CPU_CORES = (() => {
   try {
@@ -136,7 +136,7 @@ const SFU_WORKER_COUNT = (() => {
       {
         requested: normalized,
         availableCores: SFU_CPU_CORES,
-      }
+      },
     );
     return SFU_CPU_CORES;
   }
@@ -147,7 +147,7 @@ if (SFU_WORKER_COUNT > 1 && !USE_WEBRTC_SERVER) {
   // Without WebRtcServer, each worker needs its own non-overlapping RTC port range.
   // This server does not currently partition RTC_MIN_PORT/RTC_MAX_PORT, so fail fast.
   throw new Error(
-    "SFU_WORKER_COUNT>1 requires USE_WEBRTC_SERVER=1 (per-worker WebRtcServer ports)"
+    "SFU_WORKER_COUNT>1 requires USE_WEBRTC_SERVER=1 (per-worker WebRtcServer ports)",
   );
 }
 
@@ -155,7 +155,7 @@ if (SFU_WORKER_COUNT > 1 && !USE_WEBRTC_SERVER) {
 const SFU_FANOUT_ENABLED = process.env.SFU_FANOUT_ENABLED === "1";
 const SFU_FANOUT_VIEWER_THRESHOLD = Number.parseInt(
   process.env.SFU_FANOUT_VIEWER_THRESHOLD || "500",
-  10
+  10,
 );
 
 // Worker port range. Used by mediasoup for RTC-related allocations.
@@ -235,7 +235,7 @@ function validateVideoRtpLayerPolicy({ socketId, rtpParameters }) {
     // Only error in strict mode when an explicit expected mode is configured.
     if (SFU_ENFORCE_VP9_SVC_MODE && SFU_EXPECT_VP9_SVC_MODE) {
       throw new Error(
-        `VP9 without scalabilityMode (expected ${SFU_EXPECT_VP9_SVC_MODE})`
+        `VP9 without scalabilityMode (expected ${SFU_EXPECT_VP9_SVC_MODE})`,
       );
     }
     // Continue into simulcast checks below (if enabled).
@@ -308,7 +308,7 @@ function parseStunServersFromEnv() {
     SFU_STUN_SERVERS: process.env.SFU_STUN_SERVERS,
     STUN_SERVERS: process.env.STUN_SERVERS,
     raw: raw,
-    rawLength: raw.length
+    rawLength: raw.length,
   });
 
   // Keep a sane default when unset.
@@ -331,7 +331,7 @@ function parseStunServersFromEnv() {
     if (lower.startsWith("turn:") || lower.startsWith("turns:")) {
       logger.warn(
         "Ignoring TURN ICE server in SFU_STUN_SERVERS; use SFU_TURN_SERVERS/SFU_TURN_SERVER*",
-        { value: token }
+        { value: token },
       );
       continue;
     }
@@ -388,7 +388,7 @@ function parseTurnServersFromJsonEnv() {
     if (normalizedUrls.length === 0) continue;
     if (!username || !credential) {
       logger.warn(
-        "Ignoring TURN server from SFU_TURN_SERVERS without username/credential"
+        "Ignoring TURN server from SFU_TURN_SERVERS without username/credential",
       );
       continue;
     }
@@ -408,7 +408,7 @@ function parseTurnServersFromNumberedEnv(limit = 4) {
     const credential = String(process.env[`SFU_TURN_PASS${i}`] || "").trim();
     if (!username || !credential) {
       logger.warn(
-        `Ignoring SFU_TURN_SERVER${i} because SFU_TURN_USER${i} or SFU_TURN_PASS${i} is missing`
+        `Ignoring SFU_TURN_SERVER${i} because SFU_TURN_USER${i} or SFU_TURN_PASS${i} is missing`,
       );
       continue;
     }
@@ -424,7 +424,7 @@ function parseTurnServersFromNumberedEnv(limit = 4) {
 
     if (urls.length === 0) {
       logger.warn(
-        `Ignoring SFU_TURN_SERVER${i} because no valid TURN urls were found`
+        `Ignoring SFU_TURN_SERVER${i} because no valid TURN urls were found`,
       );
       continue;
     }
@@ -465,7 +465,7 @@ const ENABLE_ROOM_REGISTRY = USE_ROMM_INTERNAL_API;
 
 const ROOM_REGISTRY_TTL_SECONDS = Number.parseInt(
   process.env.ROOM_REGISTRY_TTL_SECONDS || "60",
-  10
+  10,
 );
 const NODE_ID = process.env.NODE_ID || crypto.randomUUID();
 // Public URL that clients should use to reach this node (signaling base URL).
@@ -479,7 +479,7 @@ function rommInternalRequest({ method, path, body, timeoutMs = 5000 }) {
   }
   if (!ROMM_SFU_INTERNAL_SECRET) {
     throw new Error(
-      "RomM internal API secret missing (ROMM_SFU_INTERNAL_SECRET)"
+      "RomM internal API secret missing (ROMM_SFU_INTERNAL_SECRET)",
     );
   }
 
@@ -535,7 +535,7 @@ function rommInternalRequest({ method, path, body, timeoutMs = 5000 }) {
               }
             }
             const err = new Error(
-              `RomM internal API error ${code} for ${method} ${url.pathname}${detail}`
+              `RomM internal API error ${code} for ${method} ${url.pathname}${detail}`,
             );
             err.statusCode = code;
             err.body = raw;
@@ -549,7 +549,7 @@ function rommInternalRequest({ method, path, body, timeoutMs = 5000 }) {
             return resolve(null);
           }
         });
-      }
+      },
     );
 
     req.setTimeout(timeoutMs, () => {
@@ -573,7 +573,7 @@ async function initRoomRegistry() {
 
   const refreshMs = Math.max(
     5000,
-    Math.floor((ROOM_REGISTRY_TTL_SECONDS * 1000) / 2)
+    Math.floor((ROOM_REGISTRY_TTL_SECONDS * 1000) / 2),
   );
   setInterval(() => {
     refreshLocalRoomRegistry().catch((e) => {
@@ -624,7 +624,7 @@ async function registryResolveRoom(roomName) {
     const rec = await rommInternalRequest({
       method: "GET",
       path: `/api/sfu/internal/rooms/resolve?room=${encodeURIComponent(
-        roomName
+        roomName,
       )}`,
     });
     return rec || null;
@@ -677,7 +677,9 @@ app.get("/list", async (req, res) => {
     const now = Date.now();
     for (const [name, info] of rooms.entries()) {
       const webSocketPlayers = countActivePlayers(info);
-      const httpJoinedPlayers = info.joinedPlayers ? info.joinedPlayers.size : 0;
+      const httpJoinedPlayers = info.joinedPlayers
+        ? info.joinedPlayers.size
+        : 0;
       const currentPlayers = webSocketPlayers + httpJoinedPlayers;
 
       // Skip empty rooms that are older than 5 minutes (unless HTTP-created and very recent)
@@ -688,7 +690,9 @@ app.get("/list", async (req, res) => {
         // Keep HTTP-created rooms for 1 minute, WebSocket-created for 5 minutes
         const keepMinutes = info.http_created ? 1 : 5;
         if (ageMinutes > keepMinutes) {
-          console.log(`[HTTP] Skipping old empty room: ${name} (${ageMinutes.toFixed(1)} minutes old)`);
+          console.log(
+            `[HTTP] Skipping old empty room: ${name} (${ageMinutes.toFixed(1)} minutes old)`,
+          );
           continue;
         }
       }
@@ -737,7 +741,7 @@ app.post("/create", async (req, res) => {
       domain,
       game_id,
       rom_hash,
-      core_type
+      core_type,
     } = req.body;
 
     if (!room_name) {
@@ -770,13 +774,13 @@ app.post("/create", async (req, res) => {
       core_type,
       http_created: true, // Mark as HTTP-created
       created_at: Date.now(),
-      chatHistory: []
+      chatHistory: [],
     };
 
     // Add lobby state for delay sync rooms
     if (netplay_mode === 1) {
       roomData.lobby_state = {
-        phase: 'waiting',
+        phase: "waiting",
         player_ready: new Map(),
       };
     }
@@ -787,7 +791,9 @@ app.post("/create", async (req, res) => {
     // Room assignment: choose a worker using least-loaded strategy
     await ensureRoomPrimaryAssigned(room_name);
 
-    console.log(`[HTTP] Room created: ${room_name} (${max_players} players, mode: ${netplay_mode}, core: ${core_type}, rom: ${rom_hash})`);
+    console.log(
+      `[HTTP] Room created: ${room_name} (${max_players} players, mode: ${netplay_mode}, core: ${core_type}, rom: ${rom_hash})`,
+    );
 
     res.json({
       room_id: room_name,
@@ -800,10 +806,9 @@ app.post("/create", async (req, res) => {
         sync_config,
         spectator_mode,
         rom_hash,
-        core_type
-      }
+        core_type,
+      },
     });
-
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     console.error("[HTTP] Room creation error:", msg);
@@ -840,7 +845,9 @@ app.post("/join/:roomId", async (req, res) => {
     }
 
     // Check if room is full (count both HTTP-joined and WebSocket-connected players)
-    const totalJoinedPlayers = (room.joinedPlayers ? room.joinedPlayers.size : 0) + countActivePlayers(room);
+    const totalJoinedPlayers =
+      (room.joinedPlayers ? room.joinedPlayers.size : 0) +
+      countActivePlayers(room);
     if (totalJoinedPlayers >= room.maxPlayers) {
       return res.status(409).json({ error: "room is full" });
     }
@@ -851,7 +858,9 @@ app.post("/join/:roomId", async (req, res) => {
     }
     room.joinedPlayers.add(player_name);
 
-    console.log(`[HTTP] Player ${player_name} joined room: ${roomId} (${room.joinedPlayers.size} HTTP joins, ${countActivePlayers(room)} WebSocket connections)`);
+    console.log(
+      `[HTTP] Player ${player_name} joined room: ${roomId} (${room.joinedPlayers.size} HTTP joins, ${countActivePlayers(room)} WebSocket connections)`,
+    );
 
     const webSocketPlayers = countActivePlayers(room);
     const httpJoinedPlayers = room.joinedPlayers ? room.joinedPlayers.size : 0;
@@ -867,10 +876,9 @@ app.post("/join/:roomId", async (req, res) => {
         sync_config: room.sync_config || null,
         spectator_mode: room.spectator_mode || 1,
         rom_hash: room.rom_hash || null,
-        core_type: room.core_type || null
-      }
+        core_type: room.core_type || null,
+      },
     });
-
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     console.error("[HTTP] Room join error:", msg);
@@ -903,7 +911,6 @@ app.post("/leave/:roomId", async (req, res) => {
     console.log(`[HTTP] Player left room: ${roomId}`);
 
     res.json({ success: true });
-
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     console.error("[HTTP] Room leave error:", msg);
@@ -976,7 +983,7 @@ app.get("/ice", async (req, res) => {
     logger.warn("/ice endpoint called, returning ICE servers:", {
       iceServers: SFU_ICE_SERVERS,
       iceServerCount: SFU_ICE_SERVERS.length,
-      nodeId: NODE_ID
+      nodeId: NODE_ID,
     });
 
     return res.json({
@@ -1019,7 +1026,7 @@ const SFU_AUTH_JTI_KEY_PREFIX =
   process.env.SFU_AUTH_JTI_KEY_PREFIX || "sfu:auth:jti:";
 const SFU_AUTH_CLOCK_SKEW_SECONDS = Number.parseInt(
   process.env.SFU_AUTH_CLOCK_SKEW_SECONDS || "5",
-  10
+  10,
 );
 
 // Security hardening: auth is ALWAYS required.
@@ -1039,7 +1046,7 @@ const SFU_ALLOW_AUTH_TAKEOVER = process.env.SFU_ALLOW_AUTH_TAKEOVER !== "0";
 // Set to 0 to remove the grace window (not recommended).
 const SFU_AUTH_TAKEOVER_GRACE_SECONDS = (() => {
   const raw = String(
-    process.env.SFU_AUTH_TAKEOVER_GRACE_SECONDS || "30"
+    process.env.SFU_AUTH_TAKEOVER_GRACE_SECONDS || "30",
   ).trim();
   const v = Number.parseInt(raw, 10);
   if (!Number.isFinite(v) || v < 0) {
@@ -1225,7 +1232,7 @@ io.use(async (socket, next) => {
     logger.debug("SFU socket auth attempt", {
       hasToken: !!token,
       tokenPrefix: token ? token.substring(0, 20) + "..." : null,
-      socketId: socket.id
+      socketId: socket.id,
     });
 
     const user = await verifySfuTokenViaRomm(token, { consume: true });
@@ -1237,7 +1244,7 @@ io.use(async (socket, next) => {
       message: err && err.message ? err.message : String(err),
       ip: socket && socket.handshake ? socket.handshake.address : undefined,
       statusCode: err.statusCode,
-      responseBody: err.body ? err.body.substring(0, 200) : undefined
+      responseBody: err.body ? err.body.substring(0, 200) : undefined,
     });
     return next(new Error("unauthorized"));
   }
@@ -1272,8 +1279,8 @@ const mediaCodecs = [
     channels: 2,
     parameters: {
       useinbandfec: 1,
-      stereo: 1
-    }
+      stereo: 1,
+    },
   },
   // Codec order matters for client Auto preference.
   // Present VP9 first, then H264, then VP8.
@@ -1353,10 +1360,11 @@ function isViewerExtra(extra) {
   }
 
   // Heuristic: if player_slot is a valid controller slot, treat as a player.
-  // Viewers typically won't set it.
+  // Viewers typically won't set it, or have slot 8 (spectator).
   try {
     const ps = extra && extra.player_slot;
     if (ps === 0 || ps === 1 || ps === 2 || ps === 3) return false;
+    if (ps === 8) return true; // Explicitly mark slot 8 as spectator
   } catch {
     // ignore
   }
@@ -1679,7 +1687,12 @@ io.on("connection", (socket) => {
     if (!room) return {};
     const users = {};
     for (const [uid, extra] of room.players.entries()) {
-      users[uid] = extra;
+      // Create a client-safe version of the extra data
+      // Exclude server-only fields like player_name (uncensored netplayID)
+      const clientExtra = { ...extra };
+      delete clientExtra.player_name; // Server-side only - uncensored netplayID
+      // Keep netplay_username for display (censored if needed)
+      users[uid] = clientExtra;
     }
     return users;
   };
@@ -1706,11 +1719,15 @@ io.on("connection", (socket) => {
   };
 
   const sfuUser = socket.data && socket.data.sfuUser;
-  // If SFU auth is enabled, bind the authenticated userid immediately.
+  // If SFU auth is enabled, generate a UUID for the userid and bind it immediately.
+  let authUserid = null;
   try {
     if (SFU_REQUIRE_AUTH) {
-      // Still store the display name separately if available.
-      bindUseridToSocket(sfuUser.sub);
+      // Generate a stable UUID based on the JWT sub for consistent user identification
+      const crypto = require('crypto');
+      authUserid = crypto.createHash('sha256').update(sfuUser.sub).digest('hex').substring(0, 36);
+      authUserid = authUserid.substring(0, 8) + '-' + authUserid.substring(8, 12) + '-' + authUserid.substring(12, 16) + '-' + authUserid.substring(16, 20) + '-' + authUserid.substring(20, 36);
+      bindUseridToSocket(authUserid);
     }
   } catch (e) {
     logger.warn("disconnecting unauthorized socket", {
@@ -1725,8 +1742,12 @@ io.on("connection", (socket) => {
     const assignedUserid = getAssignedUserid();
     if (!assignedUserid) throw new Error("unauthorized");
 
+    // For SFU auth, use the JWT sub as the player display name
+    if (SFU_REQUIRE_AUTH && sfuUser) {
+      storedExtra.player_name = sfuUser.sub; // Use JWT sub as display name
+    }
+
     // Do not trust client-provided userid when SFU auth is enabled.
-    // Some clients send legacy/ephemeral ids that won't match RoMM's userid.
     if (
       storedExtra &&
       storedExtra.userid !== undefined &&
@@ -1739,9 +1760,10 @@ io.on("connection", (socket) => {
           socket: socket.id,
           clientUserid: storedExtra.userid,
           assignedUserid,
-        }
+        },
       );
     }
+
     // Backup the original netplay username if we apply rewriting.
     // Example, if enforcing server side censorship on federated netplay.
     // This way we can identify users on server, but censor for clients.
@@ -1825,7 +1847,7 @@ io.on("connection", (socket) => {
       } else {
         if (!process.env.ANNOUNCED_IP) {
           throw new Error(
-            "CRITICAL: ANNOUNCED_IP environment variable is not defined!"
+            "CRITICAL: ANNOUNCED_IP environment variable is not defined!",
           );
         }
 
@@ -1837,9 +1859,8 @@ io.on("connection", (socket) => {
         ];
       }
 
-      const transport = await roomRouter.createWebRtcTransport(
-        transportOptions
-      );
+      const transport =
+        await roomRouter.createWebRtcTransport(transportOptions);
 
       peers.get(socket.id).transports.set(transport.id, transport);
       logger.debug("sfu-create-transport:", {
@@ -1883,7 +1904,7 @@ io.on("connection", (socket) => {
         console.error("sfu-connect-transport error", err);
         cb && cb(err.message);
       }
-    }
+    },
   );
 
   // ICE restart support for clients that experience network path changes.
@@ -2047,13 +2068,13 @@ io.on("connection", (socket) => {
         logger.debug("producer paused", {
           socket: socket.id,
           producerId: producer.id,
-        })
+        }),
       );
       producer.on("resume", () =>
         logger.debug("producer resumed", {
           socket: socket.id,
           producerId: producer.id,
-        })
+        }),
       );
       producer.on("close", () => {
         logger.debug("producer closed", {
@@ -2112,7 +2133,7 @@ io.on("connection", (socket) => {
     "producedata",
     async (
       { transportId, sctpStreamParameters, label, protocol, appData },
-      cb
+      cb,
     ) => {
       try {
         logger.debug("sfu-produce-data request from", socket.id, {
@@ -2156,7 +2177,7 @@ io.on("connection", (socket) => {
         } catch (e) {
           logger.warn(
             "sfu-produce-data: failed to close previous dataProducers",
-            e
+            e,
           );
         }
 
@@ -2199,7 +2220,11 @@ io.on("connection", (socket) => {
           dataProducer.on("message", (message, ppid) => {
             try {
               // Allow JSON protocol data channels (used by EmulatorJS for input relay)
-              if (dataProducer.protocol === "json" || isBinaryDataChannelMessage(message, ppid)) return;
+              if (
+                dataProducer.protocol === "json" ||
+                isBinaryDataChannelMessage(message, ppid)
+              )
+                return;
 
               logger.warn("dataProducer sent non-binary message; closing", {
                 socket: socket.id,
@@ -2256,7 +2281,7 @@ io.on("connection", (socket) => {
               dataProducerId: dataProducer.id,
               label: dataProducer.label,
               totalSocketsInRoom: socketsInRoom.length,
-              socketIdsInRoom: socketsInRoom.map(s => s.id),
+              socketIdsInRoom: socketsInRoom.map((s) => s.id),
             });
 
             for (const s of socketsInRoom) {
@@ -2264,7 +2289,8 @@ io.on("connection", (socket) => {
                 logger.info("skipping socket for data producer broadcast", {
                   skippedSocketId: s?.id,
                   producerSocketId: socket.id,
-                  reason: s?.id === socket.id ? "same socket" : "invalid socket",
+                  reason:
+                    s?.id === socket.id ? "same socket" : "invalid socket",
                 });
                 continue;
               }
@@ -2303,7 +2329,7 @@ io.on("connection", (socket) => {
             logger.warn(
               "Failed to broadcast new-data-producer to room",
               roomName,
-              e
+              e,
             );
           }
         }
@@ -2313,7 +2339,7 @@ io.on("connection", (socket) => {
         console.error("sfu-produce-data error", err);
         cb && cb(err.message);
       }
-    }
+    },
   );
 
   socket.on("sfu-get-data-producers", async (data, cb) => {
@@ -2342,7 +2368,7 @@ io.on("connection", (socket) => {
           if (SFU_FANOUT_ENABLED && workerPool.length > 1) {
             const targetWorkerIdx = getPeerAssignedWorkerIdx(
               socket.id,
-              roomName
+              roomName,
             );
             const meta = dataProducerMeta.get(pid);
             const sourceWorkerIdx =
@@ -2557,25 +2583,38 @@ io.on("connection", (socket) => {
         }
       }
 
-      console.log(`[SFU] sfu-get-producers: checking producers for sockets:`, Array.from(socketIds));
+      console.log(
+        `[SFU] sfu-get-producers: checking producers for sockets:`,
+        Array.from(socketIds),
+      );
       for (const sid of socketIds) {
         const pinfo = peers.get(sid);
         if (!pinfo || !pinfo.producers) {
-          console.log(`[SFU] sfu-get-producers: no producers for socket ${sid}`);
+          console.log(
+            `[SFU] sfu-get-producers: no producers for socket ${sid}`,
+          );
           continue;
         }
-        console.log(`[SFU] sfu-get-producers: found ${pinfo.producers.size} producers for socket ${sid}`);
+        console.log(
+          `[SFU] sfu-get-producers: found ${pinfo.producers.size} producers for socket ${sid}`,
+        );
         for (const [pid] of pinfo.producers) {
-          console.log(`[SFU] sfu-get-producers: processing producer ${pid} from socket ${sid}`);
+          console.log(
+            `[SFU] sfu-get-producers: processing producer ${pid} from socket ${sid}`,
+          );
           let outId = pid;
 
           // Check if piping is needed
           const targetWorkerIdx = getPeerAssignedWorkerIdx(socket.id, roomName);
           const sourceWorkerIdx = getPeerAssignedWorkerIdx(sid, roomName);
-          console.log(`[SFU] sfu-get-producers: producer ${pid} - source worker: ${sourceWorkerIdx}, target worker: ${targetWorkerIdx}`);
+          console.log(
+            `[SFU] sfu-get-producers: producer ${pid} - source worker: ${sourceWorkerIdx}, target worker: ${targetWorkerIdx}`,
+          );
 
           if (sourceWorkerIdx !== targetWorkerIdx) {
-            console.log(`[SFU] sfu-get-producers: attempting to pipe producer ${pid} from worker ${sourceWorkerIdx} to ${targetWorkerIdx}`);
+            console.log(
+              `[SFU] sfu-get-producers: attempting to pipe producer ${pid} from worker ${sourceWorkerIdx} to ${targetWorkerIdx}`,
+            );
             try {
               const pipedId = await ensurePipedProducerForWorker({
                 roomName,
@@ -2583,22 +2622,31 @@ io.on("connection", (socket) => {
                 targetWorkerIdx,
               });
               if (pipedId) {
-                console.log(`[SFU] sfu-get-producers: successfully piped ${pid} -> ${pipedId}`);
+                console.log(
+                  `[SFU] sfu-get-producers: successfully piped ${pid} -> ${pipedId}`,
+                );
                 outId = pipedId;
               } else {
-                console.log(`[SFU] sfu-get-producers: piping failed for ${pid}, using original ID`);
+                console.log(
+                  `[SFU] sfu-get-producers: piping failed for ${pid}, using original ID`,
+                );
               }
             } catch (pipeError) {
-              console.error(`[SFU] sfu-get-producers: piping error for ${pid}:`, pipeError);
+              console.error(
+                `[SFU] sfu-get-producers: piping error for ${pid}:`,
+                pipeError,
+              );
             }
           } else {
-            console.log(`[SFU] sfu-get-producers: no piping needed for ${pid} (same worker)`);
+            console.log(
+              `[SFU] sfu-get-producers: no piping needed for ${pid} (same worker)`,
+            );
           }
 
           if (SFU_FANOUT_ENABLED && workerPool.length > 1) {
             const targetWorkerIdx = getPeerAssignedWorkerIdx(
               socket.id,
-              roomName
+              roomName,
             );
             const meta = producerMeta.get(pid);
             const sourceWorkerIdx =
@@ -2632,11 +2680,15 @@ io.on("connection", (socket) => {
           // Include producer metadata for proper client handling
           const producer = pinfo.producers.get(pid); // Get the actual producer object
           const meta = producerMeta.get(pid); // Get producer metadata
-          const producerKind = meta ? meta.kind : (producer ? producer.kind : 'unknown');
+          const producerKind = meta
+            ? meta.kind
+            : producer
+              ? producer.kind
+              : "unknown";
 
           list.push({
             id: outId,
-            kind: producerKind
+            kind: producerKind,
           });
         } // Close inner for loop
       } // Close outer for loop
@@ -2645,7 +2697,7 @@ io.on("connection", (socket) => {
         socket: socket.id,
         room: roomName,
         returned: list.length,
-        producers: list
+        producers: list,
       });
       cb && cb(null, list);
     } catch (e) {
@@ -2693,7 +2745,7 @@ io.on("connection", (socket) => {
           core_type: null,
           lobby_state: null,
           chatHistory: [],
-          mutex: new Mutex() // Mutex for thread-safe slot assignment
+          mutex: new Mutex(), // Mutex for thread-safe slot assignment
         };
         rooms.set(roomName, room);
         locallyHostedRooms.add(roomName);
@@ -2718,11 +2770,16 @@ io.on("connection", (socket) => {
       }
 
       // Update room metadata from extra data
-      if (storedExtra.netplay_mode !== undefined) room.netplay_mode = storedExtra.netplay_mode;
-      if (storedExtra.sync_config !== undefined) room.sync_config = storedExtra.sync_config;
-      if (storedExtra.spectator_mode !== undefined) room.spectator_mode = storedExtra.spectator_mode;
-      if (storedExtra.rom_hash !== undefined) room.rom_hash = storedExtra.rom_hash;
-      if (storedExtra.core_type !== undefined) room.core_type = storedExtra.core_type;
+      if (storedExtra.netplay_mode !== undefined)
+        room.netplay_mode = storedExtra.netplay_mode;
+      if (storedExtra.sync_config !== undefined)
+        room.sync_config = storedExtra.sync_config;
+      if (storedExtra.spectator_mode !== undefined)
+        room.spectator_mode = storedExtra.spectator_mode;
+      if (storedExtra.rom_hash !== undefined)
+        room.rom_hash = storedExtra.rom_hash;
+      if (storedExtra.core_type !== undefined)
+        room.core_type = storedExtra.core_type;
 
       // Room assignment: choose a worker using least-loaded strategy and
       // create a dedicated router for this room on that worker.
@@ -2749,7 +2806,11 @@ io.on("connection", (socket) => {
       socket.join(roomName);
       logger.debug(`room opened: ${roomName} by ${socket.id}`);
       const roomUsers = listRoomUsers(roomName);
-      logger.debug("sending users-updated to room (open-room)", { roomName, userCount: Object.keys(roomUsers).length, users: roomUsers });
+      logger.debug("sending users-updated to room (open-room)", {
+        roomName,
+        userCount: Object.keys(roomUsers).length,
+        users: roomUsers,
+      });
       io.to(roomName).emit("users-updated", roomUsers);
       cb && cb(null);
     } catch (err) {
@@ -2762,13 +2823,15 @@ io.on("connection", (socket) => {
     console.log(`[SFU] join-room event received from ${socket.id}:`, {
       roomName: data?.extra?.room_name,
       playerName: data?.extra?.player_name,
-      playerId: data?.extra?.userid
+      playerId: data?.extra?.userid,
     });
 
     try {
       const { extra, password = "" } = data || {};
       if (!extra || !extra.room_name) {
-        console.log("[SFU] join-room: invalid data, missing extra or room_name");
+        console.log(
+          "[SFU] join-room: invalid data, missing extra or room_name",
+        );
         return cb && cb("invalid");
       }
       const roomName = extra.room_name;
@@ -2794,7 +2857,11 @@ io.on("connection", (socket) => {
               nodeId: resolved.nodeId,
             })
           );
-        } else if (resolved && resolved.url === PUBLIC_URL && resolved.nodeId === NODE_ID) {
+        } else if (
+          resolved &&
+          resolved.url === PUBLIC_URL &&
+          resolved.nodeId === NODE_ID
+        ) {
           // Room exists in registry for this node but is missing from memory (e.g., after SFU restart).
           // Clean up the stale registry entry since the room no longer exists.
           logger.warn("Cleaning up stale room registry entry", {
@@ -2828,20 +2895,27 @@ io.on("connection", (socket) => {
           // ROM/Core mismatch - check if spectators are allowed
           if (room.spectator_mode === 1) {
             // Spectators allowed - suggest joining as spectator
-            return cb && cb({
-              error: "incompatible_game",
-              message: "ROM or emulator core doesn't match room requirements",
-              canJoinAsSpectator: true,
-              requiredRomHash: room.rom_hash,
-              requiredCoreType: room.core_type
-            });
+            return (
+              cb &&
+              cb({
+                error: "incompatible_game",
+                message: "ROM or emulator core doesn't match room requirements",
+                canJoinAsSpectator: true,
+                requiredRomHash: room.rom_hash,
+                requiredCoreType: room.core_type,
+              })
+            );
           } else {
             // Spectators not allowed - reject join
-            return cb && cb({
-              error: "incompatible_game",
-              message: "ROM or emulator core doesn't match room requirements and spectators are not allowed",
-              canJoinAsSpectator: false
-            });
+            return (
+              cb &&
+              cb({
+                error: "incompatible_game",
+                message:
+                  "ROM or emulator core doesn't match room requirements and spectators are not allowed",
+                canJoinAsSpectator: false,
+              })
+            );
           }
         }
       }
@@ -2860,7 +2934,11 @@ io.on("connection", (socket) => {
       // Check room capacity for active players only (exclude spectators)
       const activePlayerCount = countActivePlayers(room);
       const isSpectator = isViewerExtra(storedExtra);
-      if (!isReconnect && !isSpectator && activePlayerCount >= room.maxPlayers) {
+      if (
+        !isReconnect &&
+        !isSpectator &&
+        activePlayerCount >= room.maxPlayers
+      ) {
         return cb && cb("room full");
       }
 
@@ -2873,17 +2951,27 @@ io.on("connection", (socket) => {
 
             // Collect all taken slots from existing players
             for (const [playerId, playerExtra] of room.players) {
-              if (!isViewerExtra(playerExtra) && playerExtra.player_slot !== undefined) {
+              if (
+                !isViewerExtra(playerExtra) &&
+                playerExtra.player_slot !== undefined
+              ) {
                 takenSlots.add(playerExtra.player_slot);
               }
             }
 
             // If requested slot is taken or invalid, find the next available slot
             let assignedSlot = requestedSlot;
-            if (takenSlots.has(requestedSlot) || requestedSlot < 0 || requestedSlot >= room.maxPlayers) {
+            if (
+              takenSlots.has(requestedSlot) ||
+              requestedSlot < 0 ||
+              (requestedSlot >= room.maxPlayers && requestedSlot !== 8)
+            ) {
               // Find first available slot
               assignedSlot = 0;
-              while (takenSlots.has(assignedSlot) && assignedSlot < room.maxPlayers) {
+              while (
+                takenSlots.has(assignedSlot) &&
+                assignedSlot < room.maxPlayers
+              ) {
                 assignedSlot++;
               }
 
@@ -2891,7 +2979,9 @@ io.on("connection", (socket) => {
                 throw new Error("no available slots");
               }
 
-              console.log(`[SFU] Reassigning player slot: ${requestedSlot} -> ${assignedSlot} for ${storedExtra.player_name}`);
+              console.log(
+                `[SFU] Reassigning player slot: ${requestedSlot} -> ${assignedSlot} for ${storedExtra.player_name}`,
+              );
             }
 
             // Update the stored extra with the assigned slot
@@ -3026,7 +3116,11 @@ io.on("connection", (socket) => {
         socket.to(roomName).emit("room-player-joined", storedExtra);
       }
       const roomUsers = listRoomUsers(roomName);
-      logger.debug("sending users-updated to room", { roomName, userCount: Object.keys(roomUsers).length, users: roomUsers });
+      logger.debug("sending users-updated to room", {
+        roomName,
+        userCount: Object.keys(roomUsers).length,
+        users: roomUsers,
+      });
       io.to(roomName).emit("users-updated", roomUsers);
       if (ENABLE_ROOM_REGISTRY) {
         registryUpsertRoom(roomName).catch((e) => {
@@ -3044,13 +3138,40 @@ io.on("connection", (socket) => {
       if (room.lobby_state) {
         response.lobby_state = {
           phase: room.lobby_state.phase,
-          player_ready: Object.fromEntries(room.lobby_state.player_ready)
+          player_ready: Object.fromEntries(room.lobby_state.player_ready),
         };
       }
 
       cb && cb(null, response);
     } catch (err) {
       console.error("join-room error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  // Request current room state (for clients that need to sync)
+  socket.on("request-room-state", (data, cb) => {
+    try {
+      const { roomName } = data || {};
+      const room = rooms.get(roomName);
+      if (!room) return cb && cb("no such room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      // Check if user is actually in this room
+      if (!room.players.has(assignedUserid)) {
+        return cb && cb("not in room");
+      }
+
+      const roomUsers = listRoomUsers(roomName);
+      cb && cb(null, {
+        users: roomUsers,
+        netplay_mode: room.netplay_mode || 0,
+        sync_config: room.sync_config || null,
+      });
+    } catch (err) {
+      console.error("request-room-state error", err);
       cb && cb(err.message || "error");
     }
   });
@@ -3104,7 +3225,11 @@ io.on("connection", (socket) => {
       socket.leave(roomName);
       socket.to(roomName).emit("room-player-left", { userid: useridToRemove });
       const roomUsers = listRoomUsers(roomName);
-      logger.debug("sending users-updated to room (leave-room)", { roomName, userCount: Object.keys(roomUsers).length, users: roomUsers });
+      logger.debug("sending users-updated to room (leave-room)", {
+        roomName,
+        userCount: Object.keys(roomUsers).length,
+        users: roomUsers,
+      });
       io.to(roomName).emit("users-updated", roomUsers);
       if (room.players.size === 0) {
         rooms.delete(roomName);
@@ -3146,17 +3271,21 @@ io.on("connection", (socket) => {
       room.lobby_state.player_ready.set(assignedUserid, true);
 
       // Check if all active players are ready
-      const activePlayers = Array.from(room.players.values()).filter(p => !isViewerExtra(p));
-      const allReady = activePlayers.every(p => room.lobby_state.player_ready.get(p.userid));
+      const activePlayers = Array.from(room.players.values()).filter(
+        (p) => !isViewerExtra(p),
+      );
+      const allReady = activePlayers.every((p) =>
+        room.lobby_state.player_ready.get(p.userid),
+      );
 
-      if (allReady && room.lobby_state.phase === 'waiting') {
-        room.lobby_state.phase = 'ready';
+      if (allReady && room.lobby_state.phase === "waiting") {
+        room.lobby_state.phase = "ready";
       }
 
       // Broadcast lobby state update
       io.to(roomName).emit("lobby-state", {
         phase: room.lobby_state.phase,
-        player_ready: Object.fromEntries(room.lobby_state.player_ready)
+        player_ready: Object.fromEntries(room.lobby_state.player_ready),
       });
 
       cb && cb(null);
@@ -3177,14 +3306,14 @@ io.on("connection", (socket) => {
 
       room.lobby_state.player_ready.set(assignedUserid, false);
 
-      if (room.lobby_state.phase === 'ready') {
-        room.lobby_state.phase = 'waiting';
+      if (room.lobby_state.phase === "ready") {
+        room.lobby_state.phase = "waiting";
       }
 
       // Broadcast lobby state update
       io.to(roomName).emit("lobby-state", {
         phase: room.lobby_state.phase,
-        player_ready: Object.fromEntries(room.lobby_state.player_ready)
+        player_ready: Object.fromEntries(room.lobby_state.player_ready),
       });
 
       cb && cb(null);
@@ -3204,18 +3333,19 @@ io.on("connection", (socket) => {
       if (room.owner !== socket.id) return cb && cb("not room owner");
 
       // Must be in ready state
-      if (room.lobby_state.phase !== 'ready') return cb && cb("not all players ready");
+      if (room.lobby_state.phase !== "ready")
+        return cb && cb("not all players ready");
 
-      room.lobby_state.phase = 'launching';
+      room.lobby_state.phase = "launching";
 
       // Broadcast launch command
       io.to(roomName).emit("game-launch", {
         seed: Date.now(), // Simple seed based on timestamp
         delay: room.sync_config?.frameDelay || 2,
-        start_frame: 1
+        start_frame: 1,
       });
 
-      room.lobby_state.phase = 'started';
+      room.lobby_state.phase = "started";
 
       cb && cb(null);
     } catch (err) {
@@ -3243,14 +3373,23 @@ io.on("connection", (socket) => {
             const isSpectator = isViewerExtra(playerExtra);
             if (!isSpectator && playerSlot !== playerExtra.player_slot) {
               // Check if slot is already taken by another player
+              // Spectators (slot 8) don't conflict with each other
               let slotTaken = false;
-              for (const [otherPlayerId, otherExtra] of room.players) {
-                if (otherPlayerId !== assignedUserid &&
+              if (playerSlot !== 8) {
+                for (const [otherPlayerId, otherExtra] of room.players) {
+                  if (
+                    otherPlayerId !== assignedUserid &&
                     !isViewerExtra(otherExtra) &&
-                    otherExtra.player_slot === playerSlot) {
-                  slotTaken = true;
-                  break;
+                    otherExtra.player_slot === playerSlot
+                  ) {
+                    slotTaken = true;
+                    break;
+                  }
                 }
+              }
+
+              if (playerSlot === playerExtra.player_slot) {
+                throw new Error(`you already have slot ${playerSlot}`);
               }
 
               if (slotTaken) {
@@ -3258,7 +3397,8 @@ io.on("connection", (socket) => {
               }
 
               // Validate slot range
-              if (playerSlot < 0 || playerSlot >= room.maxPlayers) {
+              // Allow slot 8 for spectators, otherwise restrict to valid player slots
+              if (playerSlot < 0 || (playerSlot >= room.maxPlayers && playerSlot !== 8)) {
                 throw new Error("invalid slot");
               }
             }
@@ -3267,16 +3407,24 @@ io.on("connection", (socket) => {
             const oldSlot = playerExtra.player_slot;
             playerExtra.player_slot = playerSlot;
 
-            console.log(`[SFU] Updated player slot: ${assignedUserid} from ${oldSlot} to ${playerSlot}`);
+            console.log(
+              `[SFU] Updated player slot: ${assignedUserid} from ${oldSlot} to ${playerSlot}`,
+            );
           });
 
           // Broadcast slot update to all players in room
-          io.to(roomName).emit("player-slot-updated", {
+          console.log(`[SFU] Broadcasting player-slot-updated to room ${roomName}:`, {
             playerId: assignedUserid,
             playerSlot: playerSlot
           });
+          io.to(roomName).emit("player-slot-updated", {
+            playerId: assignedUserid,
+            playerSlot: playerSlot,
+          });
         } catch (error) {
-          console.log(`[SFU] Slot update failed for ${assignedUserid}: ${error.message}`);
+          console.log(
+            `[SFU] Slot update failed for ${assignedUserid}: ${error.message}`,
+          );
           return cb && cb(error.message);
         }
       }
@@ -3293,7 +3441,11 @@ io.on("connection", (socket) => {
     try {
       const { roomName, frame } = data || {};
       const room = rooms.get(roomName);
-      if (!room || !room.lobby_state || room.lobby_state.phase !== 'launching') {
+      if (
+        !room ||
+        !room.lobby_state ||
+        room.lobby_state.phase !== "launching"
+      ) {
         return cb && cb("not launching");
       }
 
@@ -3307,17 +3459,23 @@ io.on("connection", (socket) => {
       room.lobby_state.ready_at_frame_1.set(assignedUserid, true);
 
       // Check if all active players are ready
-      const activePlayers = Array.from(room.players.values()).filter(p => !isViewerExtra(p));
-      const allReady = activePlayers.every(p => room.lobby_state.ready_at_frame_1.get(p.userid));
+      const activePlayers = Array.from(room.players.values()).filter(
+        (p) => !isViewerExtra(p),
+      );
+      const allReady = activePlayers.every((p) =>
+        room.lobby_state.ready_at_frame_1.get(p.userid),
+      );
 
       if (allReady) {
         // All players ready - send START signal
         const startTime = Date.now() + 100; // Start in 100ms
         io.to(roomName).emit("start-game", {
           frame: frame,
-          start_time: startTime
+          start_time: startTime,
         });
-        console.log(`[SFU] All players ready at frame ${frame}, starting game at ${startTime}`);
+        console.log(
+          `[SFU] All players ready at frame ${frame}, starting game at ${startTime}`,
+        );
       }
 
       cb && cb(null);
@@ -3428,9 +3586,10 @@ io.on("connection", (socket) => {
   socket.on(
     "sfu-consume",
     async ({ producerId, transportId, rtpCapabilities, ignoreDtx }, cb) => {
-      console.log(`[SFU] sfu-consume request from ${socket.id}: producerId=${producerId}, transportId=${transportId}`);
+      console.log(
+        `[SFU] sfu-consume request from ${socket.id}: producerId=${producerId}, transportId=${transportId}`,
+      );
       try {
-
         const roomName = getSocketRoomName();
         if (!roomName) throw new Error("no room");
         if (!rooms.has(roomName)) throw new Error("no such room");
@@ -3441,7 +3600,7 @@ io.on("connection", (socket) => {
         const consumerWorkerIdx = getPeerAssignedWorkerIdx(socket.id, roomName);
         const consumerRouter = await getOrCreateRoomRouter(
           roomName,
-          consumerWorkerIdx
+          consumerWorkerIdx,
         );
 
         let effectiveProducerId = producerId;
@@ -3522,50 +3681,62 @@ io.on("connection", (socket) => {
         const transportOwner = peer.transports.get(transportId);
         if (!transportOwner) throw new Error("transport not found");
 
-        console.log(`[SFU] Attempting to consume producer ${effectiveProducerId} on transport ${transportId}`);
-      console.log(`[SFU] Consumer router instance:`, consumerRouter);
-      console.log(`[SFU] Transport router:`, transportOwner.router ? 'same router' : 'different router');
+        console.log(
+          `[SFU] Attempting to consume producer ${effectiveProducerId} on transport ${transportId}`,
+        );
+        console.log(`[SFU] Consumer router instance:`, consumerRouter);
+        console.log(
+          `[SFU] Transport router:`,
+          transportOwner.router ? "same router" : "different router",
+        );
 
-      // Check if producer exists on router
-      try {
-        const producers = consumerRouter.producers;
-        console.log(`[SFU] Router has ${producers.size} producers`);
-        const producerExists = Array.from(producers.keys()).includes(effectiveProducerId);
-        console.log(`[SFU] Producer ${effectiveProducerId} exists on router: ${producerExists}`);
-      } catch (e) {
-        console.log(`[SFU] Error checking producers:`, e.message);
-      }
+        // Check if producer exists on router
+        try {
+          const producers = consumerRouter.producers;
+          console.log(`[SFU] Router has ${producers.size} producers`);
+          const producerExists = Array.from(producers.keys()).includes(
+            effectiveProducerId,
+          );
+          console.log(
+            `[SFU] Producer ${effectiveProducerId} exists on router: ${producerExists}`,
+          );
+        } catch (e) {
+          console.log(`[SFU] Error checking producers:`, e.message);
+        }
 
-      // Determine if this is an audio consumer to apply ignoreDtx
-      // Check producer metadata or get producer from router to determine kind
-      let isAudioConsumer = false;
-      if (ignoreDtx !== undefined) {
-        isAudioConsumer = ignoreDtx;
-      } else {
-        // Fallback: check producer metadata or producer object
-        const meta = producerMeta.get(effectiveProducerId);
-        if (meta && meta.kind === 'audio') {
-          isAudioConsumer = true;
+        // Determine if this is an audio consumer to apply ignoreDtx
+        // Check producer metadata or get producer from router to determine kind
+        let isAudioConsumer = false;
+        if (ignoreDtx !== undefined) {
+          isAudioConsumer = ignoreDtx;
         } else {
-          // Try to get producer from router
-          try {
-            const producer = consumerRouter.producers.get(effectiveProducerId);
-            if (producer && producer.kind === 'audio') {
-              isAudioConsumer = true;
+          // Fallback: check producer metadata or producer object
+          const meta = producerMeta.get(effectiveProducerId);
+          if (meta && meta.kind === "audio") {
+            isAudioConsumer = true;
+          } else {
+            // Try to get producer from router
+            try {
+              const producer =
+                consumerRouter.producers.get(effectiveProducerId);
+              if (producer && producer.kind === "audio") {
+                isAudioConsumer = true;
+              }
+            } catch (e) {
+              // Ignore errors, default to false
             }
-          } catch (e) {
-            // Ignore errors, default to false
           }
         }
-      }
 
-      const consumer = await transportOwner.consume({
-        producerId: effectiveProducerId,
-        rtpCapabilities,
-        paused: false,
-        ignoreDtx: isAudioConsumer, // Ignore DTX for audio consumers to prevent sync drift
-      });
-      console.log(`[SFU] Successfully created consumer ${consumer.id} for producer ${effectiveProducerId}`);
+        const consumer = await transportOwner.consume({
+          producerId: effectiveProducerId,
+          rtpCapabilities,
+          paused: false,
+          ignoreDtx: isAudioConsumer, // Ignore DTX for audio consumers to prevent sync drift
+        });
+        console.log(
+          `[SFU] Successfully created consumer ${consumer.id} for producer ${effectiveProducerId}`,
+        );
 
         peer.consumers.set(consumer.id, consumer);
 
@@ -3606,7 +3777,7 @@ io.on("connection", (socket) => {
               codecs:
                 params.rtpParameters.codecs &&
                 params.rtpParameters.codecs.map((c) => c.mimeType),
-            }
+            },
           );
         } catch (e) {
           /* ignore */
@@ -3617,7 +3788,7 @@ io.on("connection", (socket) => {
         console.error("sfu-consume error", err);
         cb && cb(err.message);
       }
-    }
+    },
   );
 
   socket.on("data-message", (data) => {
@@ -3658,7 +3829,7 @@ io.on("connection", (socket) => {
       const playerName = playerData?.player_name || peer.userid || "Unknown";
 
       // Validate message
-      if (!data || !data.message || typeof data.message !== 'string') {
+      if (!data || !data.message || typeof data.message !== "string") {
         logger.warn("chat-message received with invalid data", {
           socket: socket.id,
           roomName,
@@ -3684,7 +3855,7 @@ io.on("connection", (socket) => {
         playerName: playerName,
         message: message,
         timestamp: Date.now(),
-        messageId: `${peer.userid}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+        messageId: `${peer.userid}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
       };
 
       // Store in room's chat history (limit to 100 messages)
@@ -3760,7 +3931,11 @@ io.on("connection", (socket) => {
       if (removedUserid) {
         io.to(roomName).emit("room-player-left", { userid: removedUserid });
         const roomUsers = listRoomUsers(roomName);
-        logger.debug("sending users-updated to room (disconnect)", { roomName, userCount: Object.keys(roomUsers).length, users: roomUsers });
+        logger.debug("sending users-updated to room (disconnect)", {
+          roomName,
+          userCount: Object.keys(roomUsers).length,
+          users: roomUsers,
+        });
         io.to(roomName).emit("users-updated", roomUsers);
         if (room.players.size === 0) {
           rooms.delete(roomName);
@@ -3850,7 +4025,9 @@ runMediasoup()
           const deleteMinutes = room.http_created ? 2 : 10;
 
           if (ageMinutes > deleteMinutes) {
-            console.log(`[Cleanup] Deleting old empty room: ${roomName} (${ageMinutes.toFixed(1)} minutes old)`);
+            console.log(
+              `[Cleanup] Deleting old empty room: ${roomName} (${ageMinutes.toFixed(1)} minutes old)`,
+            );
             toDelete.push(roomName);
           }
         }
@@ -3863,7 +4040,7 @@ runMediasoup()
     }, 60000); // Check every minute
 
     server.listen(PORT, "0.0.0.0", () =>
-      logger.info(`SFU server listening on port ${PORT} (bound to 0.0.0.0)`)
+      logger.info(`SFU server listening on port ${PORT} (bound to 0.0.0.0)`),
     );
   })
   .catch((err) => {
