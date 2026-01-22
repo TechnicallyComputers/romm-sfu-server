@@ -7,6 +7,40 @@ const express = require("express");
 const { Server } = require("socket.io");
 const mediasoup = require("mediasoup");
 
+// Simple Mutex implementation using Promises
+class Mutex {
+  constructor() {
+    this._locked = false;
+    this._waiting = [];
+  }
+
+  async runExclusive(fn) {
+    return new Promise((resolve, reject) => {
+      const run = async () => {
+        try {
+          const result = await fn();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        } finally {
+          this._locked = false;
+          if (this._waiting.length > 0) {
+            const next = this._waiting.shift();
+            next();
+          }
+        }
+      };
+
+      if (this._locked) {
+        this._waiting.push(run);
+      } else {
+        this._locked = true;
+        run();
+      }
+    });
+  }
+}
+
 // Logging
 // Default is intentionally quiet to avoid flooding systemd/nginx logs.
 // Set LOG_LEVEL=info|debug to re-enable more output.
@@ -2658,13 +2692,19 @@ io.on("connection", (socket) => {
           rom_hash: null,
           core_type: null,
           lobby_state: null,
-          chatHistory: []
+          chatHistory: [],
+          mutex: new Mutex() // Mutex for thread-safe slot assignment
         };
         rooms.set(roomName, room);
         locallyHostedRooms.add(roomName);
       }
 
       const storedExtra = applyAuthToExtra(normalizeExtra(extra));
+
+      // For room creation, ensure the host gets player slot 0
+      if (!room.players.has(storedExtra.userid)) {
+        storedExtra.player_slot = 0;
+      }
 
       // Bind this socket to its claimed userid once, server-side.
       bindUseridToSocket(storedExtra.userid);
@@ -2822,6 +2862,44 @@ io.on("connection", (socket) => {
       const isSpectator = isViewerExtra(storedExtra);
       if (!isReconnect && !isSpectator && activePlayerCount >= room.maxPlayers) {
         return cb && cb("room full");
+      }
+
+      // Validate and assign player slot (only for active players, not spectators)
+      if (!isSpectator && !isReconnect) {
+        try {
+          await room.mutex.runExclusive(async () => {
+            const requestedSlot = storedExtra.player_slot || 0;
+            const takenSlots = new Set();
+
+            // Collect all taken slots from existing players
+            for (const [playerId, playerExtra] of room.players) {
+              if (!isViewerExtra(playerExtra) && playerExtra.player_slot !== undefined) {
+                takenSlots.add(playerExtra.player_slot);
+              }
+            }
+
+            // If requested slot is taken or invalid, find the next available slot
+            let assignedSlot = requestedSlot;
+            if (takenSlots.has(requestedSlot) || requestedSlot < 0 || requestedSlot >= room.maxPlayers) {
+              // Find first available slot
+              assignedSlot = 0;
+              while (takenSlots.has(assignedSlot) && assignedSlot < room.maxPlayers) {
+                assignedSlot++;
+              }
+
+              if (assignedSlot >= room.maxPlayers) {
+                throw new Error("no available slots");
+              }
+
+              console.log(`[SFU] Reassigning player slot: ${requestedSlot} -> ${assignedSlot} for ${storedExtra.player_name}`);
+            }
+
+            // Update the stored extra with the assigned slot
+            storedExtra.player_slot = assignedSlot;
+          });
+        } catch (error) {
+          return cb && cb(error.message || "slot assignment failed");
+        }
       }
       const existingSid =
         existingExtra && (existingExtra.socketId || existingExtra.socket_id);
@@ -3147,7 +3225,7 @@ io.on("connection", (socket) => {
   });
 
   // Player slot updates for delay sync rooms
-  socket.on("update-player-slot", (data, cb) => {
+  socket.on("update-player-slot", async (data, cb) => {
     try {
       const { roomName, playerSlot } = data || {};
       const room = rooms.get(roomName);
@@ -3156,16 +3234,51 @@ io.on("connection", (socket) => {
       const assignedUserid = getAssignedUserid();
       if (!assignedUserid) return cb && cb("not authenticated");
 
-      // Update player's slot
+      // Validate and update player's slot
       const playerExtra = room.players.get(assignedUserid);
       if (playerExtra) {
-        playerExtra.player_slot = playerSlot;
+        try {
+          await room.mutex.runExclusive(async () => {
+            // Check if the requested slot is available (not taken by another active player)
+            const isSpectator = isViewerExtra(playerExtra);
+            if (!isSpectator && playerSlot !== playerExtra.player_slot) {
+              // Check if slot is already taken by another player
+              let slotTaken = false;
+              for (const [otherPlayerId, otherExtra] of room.players) {
+                if (otherPlayerId !== assignedUserid &&
+                    !isViewerExtra(otherExtra) &&
+                    otherExtra.player_slot === playerSlot) {
+                  slotTaken = true;
+                  break;
+                }
+              }
 
-        // Broadcast slot update to all players in room
-        io.to(roomName).emit("player-slot-updated", {
-          playerId: assignedUserid,
-          playerSlot: playerSlot
-        });
+              if (slotTaken) {
+                throw new Error("slot taken");
+              }
+
+              // Validate slot range
+              if (playerSlot < 0 || playerSlot >= room.maxPlayers) {
+                throw new Error("invalid slot");
+              }
+            }
+
+            // Update the slot
+            const oldSlot = playerExtra.player_slot;
+            playerExtra.player_slot = playerSlot;
+
+            console.log(`[SFU] Updated player slot: ${assignedUserid} from ${oldSlot} to ${playerSlot}`);
+          });
+
+          // Broadcast slot update to all players in room
+          io.to(roomName).emit("player-slot-updated", {
+            playerId: assignedUserid,
+            playerSlot: playerSlot
+          });
+        } catch (error) {
+          console.log(`[SFU] Slot update failed for ${assignedUserid}: ${error.message}`);
+          return cb && cb(error.message);
+        }
       }
 
       cb && cb(null);
