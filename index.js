@@ -592,9 +592,13 @@ async function registryUpsertRoom(roomName) {
     current: countActivePlayers(room),
     max: room.maxPlayers,
     hasPassword: !!room.password,
-    netplay_mode: room.netplay_mode || 0,
+    netplay_mode: room.netplay_mode || "live_stream",
+    room_phase: room.room_phase || "running",
     sync_config: room.sync_config || null,
     spectator_mode: room.spectator_mode || 1,
+    // Include metadata for DELAY_SYNC rooms
+    metadata: room.metadata || null,
+    // Legacy fields for backward compatibility
     rom_hash: room.rom_hash || null,
     core_type: room.core_type || null,
     nodeId: NODE_ID,
@@ -767,11 +771,25 @@ app.post("/create", async (req, res) => {
       joinedPlayers, // Track HTTP-joined players
       maxPlayers: max_players,
       password,
-      netplay_mode,
+      netplay_mode: netplay_mode === 1 ? "delay_sync" : "live_stream",
+      room_phase: netplay_mode === 1 ? "lobby" : "running",
       sync_config,
       spectator_mode,
+      // Legacy fields for backward compatibility
       rom_hash,
       core_type,
+      // New structured metadata for DELAY_SYNC
+      metadata: netplay_mode === 1 ? {
+        rom: {
+          displayName: rom_hash || 'Unknown ROM',
+          hash: rom_hash ? { algo: 'sha256', value: rom_hash } : null
+        },
+        emulator: {
+          id: core_type || 'unknown',
+          displayName: core_type || 'Unknown Emulator',
+          coreVersion: null
+        }
+      } : null,
       http_created: true, // Mark as HTTP-created
       created_at: Date.now(),
       chatHistory: [],
@@ -872,7 +890,8 @@ app.post("/join/:roomId", async (req, res) => {
         current: webSocketPlayers + httpJoinedPlayers,
         max: room.maxPlayers,
         hasPassword: !!room.password,
-        netplay_mode: room.netplay_mode || 0,
+        netplay_mode: room.netplay_mode || "live_stream",
+        room_phase: room.room_phase || "running",
         sync_config: room.sync_config || null,
         spectator_mode: room.spectator_mode || 1,
         rom_hash: room.rom_hash || null,
@@ -1690,6 +1709,11 @@ io.on("connection", (socket) => {
       // Create a client-safe version of the extra data
       // Exclude server-only fields like player_name (uncensored netplayID)
       const clientExtra = { ...extra };
+      // Mark the room owner
+      if (extra.userid === room.owner) {
+        console.log(`[SFU] Setting is_host for player ${uid}`);
+        clientExtra.is_host = true;
+      }
       delete clientExtra.player_name; // Server-side only - uncensored netplayID
       // Keep netplay_username for display (censored if needed)
       users[uid] = clientExtra;
@@ -1724,9 +1748,22 @@ io.on("connection", (socket) => {
   try {
     if (SFU_REQUIRE_AUTH) {
       // Generate a stable UUID based on the JWT sub for consistent user identification
-      const crypto = require('crypto');
-      authUserid = crypto.createHash('sha256').update(sfuUser.sub).digest('hex').substring(0, 36);
-      authUserid = authUserid.substring(0, 8) + '-' + authUserid.substring(8, 12) + '-' + authUserid.substring(12, 16) + '-' + authUserid.substring(16, 20) + '-' + authUserid.substring(20, 36);
+      const crypto = require("crypto");
+      authUserid = crypto
+        .createHash("sha256")
+        .update(sfuUser.sub)
+        .digest("hex")
+        .substring(0, 36);
+      authUserid =
+        authUserid.substring(0, 8) +
+        "-" +
+        authUserid.substring(8, 12) +
+        "-" +
+        authUserid.substring(12, 16) +
+        "-" +
+        authUserid.substring(16, 20) +
+        "-" +
+        authUserid.substring(20, 36);
       bindUseridToSocket(authUserid);
     }
   } catch (e) {
@@ -1764,18 +1801,20 @@ io.on("connection", (socket) => {
       );
     }
 
-    // Backup the original netplay username if we apply rewriting.
-    // Example, if enforcing server side censorship on federated netplay.
-    // This way we can identify users on server, but censor for clients.
-    if (sfuUser && sfuUser.netplay_username) {
-      storedExtra.netplay_username = sfuUser.netplay_username;
-    }
-    storedExtra.userid = assignedUserid;
-
     // We use player_name as single source of truth for client software
     // netplay_username is only used for server side identification.
     // This allows server side identification, but censor for clients.
-    storedExtra.player_name = assignedUserid;
+    if (!storedExtra.player_name) {
+      storedExtra.player_name = assignedUserid;
+    }
+
+    // Backup the original netplay username if we apply rewriting.
+    // Example, if enforcing server side censorship on federated netplay.
+    // This way we can identify users on server, but censor for clients.
+    if (sfuUser) {
+      storedExtra.netplay_username = storedExtra.player_name;
+    }
+    storedExtra.userid = assignedUserid;
 
     return storedExtra;
   };
@@ -2733,12 +2772,14 @@ io.on("connection", (socket) => {
         }
       } else {
         // Create new room
+        const assignedUserid = getAssignedUserid();
         room = {
-          owner: socket.id,
+          owner: assignedUserid,
           players: new Map(),
           maxPlayers,
           password,
-          netplay_mode: 0,
+          netplay_mode: "live_stream", // Default to live_stream
+          room_phase: "running", // Default to running for backward compatibility
           sync_config: null,
           spectator_mode: 1,
           rom_hash: null,
@@ -2762,6 +2803,10 @@ io.on("connection", (socket) => {
       bindUseridToSocket(storedExtra.userid);
 
       // Add player to room (or update if already exists)
+      // Initialize ready state for DELAY_SYNC rooms
+      if (room.netplay_mode === "delay_sync") {
+        storedExtra.ready = false;
+      }
       room.players.set(storedExtra.userid, storedExtra);
 
       // Set as owner if room doesn't have one (HTTP-created rooms start with null owner)
@@ -2772,10 +2817,14 @@ io.on("connection", (socket) => {
       // Update room metadata from extra data
       if (storedExtra.netplay_mode !== undefined)
         room.netplay_mode = storedExtra.netplay_mode;
+      if (storedExtra.room_phase !== undefined)
+        room.room_phase = storedExtra.room_phase;
       if (storedExtra.sync_config !== undefined)
         room.sync_config = storedExtra.sync_config;
       if (storedExtra.spectator_mode !== undefined)
         room.spectator_mode = storedExtra.spectator_mode;
+      if (storedExtra.metadata !== undefined)
+        room.metadata = storedExtra.metadata;
       if (storedExtra.rom_hash !== undefined)
         room.rom_hash = storedExtra.rom_hash;
       if (storedExtra.core_type !== undefined)
@@ -3130,7 +3179,8 @@ io.on("connection", (socket) => {
       logger.debug(`socket ${socket.id} joined room ${roomName}`);
       const response = {
         users: roomUsers,
-        netplay_mode: room.netplay_mode || 0,
+        netplay_mode: room.netplay_mode || "live_stream",
+        room_phase: room.room_phase || "running",
         sync_config: room.sync_config || null,
       };
 
@@ -3165,11 +3215,13 @@ io.on("connection", (socket) => {
       }
 
       const roomUsers = listRoomUsers(roomName);
-      cb && cb(null, {
-        users: roomUsers,
-        netplay_mode: room.netplay_mode || 0,
-        sync_config: room.sync_config || null,
-      });
+      cb &&
+        cb(null, {
+          users: roomUsers,
+          netplay_mode: room.netplay_mode || "live_stream",
+          room_phase: room.room_phase || "running",
+          sync_config: room.sync_config || null,
+        });
     } catch (err) {
       console.error("request-room-state error", err);
       cb && cb(err.message || "error");
@@ -3209,13 +3261,22 @@ io.on("connection", (socket) => {
       // Fallback for legacy clients that never joined/opened properly.
       if (!useridToRemove) {
         for (const [uid, extra] of room.players.entries()) {
-          if (
-            (extra && extra.socketId === socket.id) ||
-            (extra && extra.socket_id === socket.id)
-          ) {
-            useridToRemove = uid;
-            break;
+          // Create a client-safe version of the extra data
+          // Exclude server-only fields like player_name (uncensored netplayID)
+          const clientExtra = { ...extra };
+          delete clientExtra.player_name; // Server-side only - uncensored netplayID
+          // Keep netplay_username for display (censored if needed)
+
+          // Mark the room owner
+          console.log(
+            `[SFU] Checking player ${uid}, socketId: ${extra.socketId}, room.owner: ${room.owner}`,
+          );
+          if (extra.socketId === room.owner) {
+            console.log(`[SFU] Setting is_host for player ${uid}`);
+            clientExtra.is_host = true;
           }
+
+          users[uid] = clientExtra;
         }
       }
 
@@ -3398,7 +3459,10 @@ io.on("connection", (socket) => {
 
               // Validate slot range
               // Allow slot 8 for spectators, otherwise restrict to valid player slots
-              if (playerSlot < 0 || (playerSlot >= room.maxPlayers && playerSlot !== 8)) {
+              if (
+                playerSlot < 0 ||
+                (playerSlot >= room.maxPlayers && playerSlot !== 8)
+              ) {
                 throw new Error("invalid slot");
               }
             }
@@ -3413,10 +3477,13 @@ io.on("connection", (socket) => {
           });
 
           // Broadcast slot update to all players in room
-          console.log(`[SFU] Broadcasting player-slot-updated to room ${roomName}:`, {
-            playerId: assignedUserid,
-            playerSlot: playerSlot
-          });
+          console.log(
+            `[SFU] Broadcasting player-slot-updated to room ${roomName}:`,
+            {
+              playerId: assignedUserid,
+              playerSlot: playerSlot,
+            },
+          );
           io.to(roomName).emit("player-slot-updated", {
             playerId: assignedUserid,
             playerSlot: playerSlot,
@@ -3436,6 +3503,195 @@ io.on("connection", (socket) => {
     }
   });
 
+  // DELAY_SYNC: Toggle ready state
+  socket.on("toggle-ready", async (data, cb) => {
+    try {
+      const { roomName } = data || {};
+      const room = rooms.get(roomName);
+      if (!room) return cb && cb("no such room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      // Only allow in DELAY_SYNC rooms in lobby phase
+      if (room.netplay_mode !== "delay_sync" || room.room_phase !== "lobby") {
+        return cb && cb("not in delay sync lobby");
+      }
+
+      const playerExtra = room.players.get(assignedUserid);
+      if (!playerExtra) return cb && cb("not in room");
+
+      // Toggle ready state
+      playerExtra.ready = !playerExtra.ready;
+
+      console.log(`[SFU] Player ${assignedUserid} ready state: ${playerExtra.ready}`);
+
+      // Broadcast ready state update
+      io.to(roomName).emit("player-ready-updated", {
+        playerId: assignedUserid,
+        ready: playerExtra.ready,
+      });
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("toggle-ready error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  // DELAY_SYNC: Start game (host only)
+  socket.on("start-game", async (data, cb) => {
+    try {
+      const { roomName } = data || {};
+      const room = rooms.get(roomName);
+      if (!room) return cb && cb("no such room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      // Only allow in DELAY_SYNC rooms in lobby phase
+      if (room.netplay_mode !== "delay_sync" || room.room_phase !== "lobby") {
+        return cb && cb("not in delay sync lobby");
+      }
+
+      // Check if caller is host
+      const playerExtra = room.players.get(assignedUserid);
+      if (!playerExtra) return cb && cb("not in room");
+
+      const isHost = assignedUserid === room.owner;
+      if (!isHost) return cb && cb("not host");
+
+      // Check if all players are ready
+      let allReady = true;
+      for (const [playerId, extra] of room.players) {
+        if (!isViewerExtra(extra) && !extra.ready) {
+          allReady = false;
+          break;
+        }
+      }
+
+      if (!allReady) {
+        return cb && cb("not all players ready");
+      }
+
+      // Transition to PREPARE phase
+      room.room_phase = "prepare";
+
+      console.log(`[SFU] Starting DELAY_SYNC game in room ${roomName}`);
+
+      // Broadcast prepare start
+      io.to(roomName).emit("prepare-start", {
+        startTime: Date.now() + 2000, // 2 seconds from now
+        startFrame: 1,
+      });
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("start-game error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  // DELAY_SYNC: Join info with validation data
+  socket.on("join-info", async (data, cb) => {
+    try {
+      const { roomName, romHash, emulatorId, emulatorVersion } = data || {};
+      const room = rooms.get(roomName);
+      if (!room) return cb && cb("no such room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      // Only validate for DELAY_SYNC rooms
+      if (room.netplay_mode !== "delay_sync") {
+        return cb && cb(null); // No validation needed for live stream
+      }
+
+      const playerExtra = room.players.get(assignedUserid);
+      if (!playerExtra) return cb && cb("not in room");
+
+      // Perform validation against room metadata
+      let validationStatus = "ok";
+      let validationReason = null;
+
+      if (room.metadata && room.metadata.rom && room.metadata.rom.hash) {
+        if (!romHash || romHash !== room.metadata.rom.hash.value) {
+          validationStatus = "rom_mismatch";
+          validationReason = `ROM mismatch: host is using ${room.metadata.rom.displayName || 'Unknown ROM'}`;
+        }
+      }
+
+      if (room.metadata && room.metadata.emulator) {
+        if (emulatorId && emulatorId !== room.metadata.emulator.id) {
+          validationStatus = "emulator_mismatch";
+          validationReason = `Emulator mismatch: host is using ${room.metadata.emulator.displayName || room.metadata.emulator.id}`;
+        }
+        // Optional version check
+        if (emulatorVersion && room.metadata.emulator.coreVersion &&
+            emulatorVersion !== room.metadata.emulator.coreVersion) {
+          validationStatus = "version_mismatch";
+          validationReason = `Core version mismatch: host is using ${room.metadata.emulator.coreVersion}`;
+        }
+      }
+
+      // Store validation status on player
+      playerExtra.validationStatus = validationStatus;
+      playerExtra.validationReason = validationReason;
+
+      console.log(`[SFU] Player ${assignedUserid} validation: ${validationStatus}`, validationReason ? `(${validationReason})` : '');
+
+      // Broadcast validation status update
+      io.to(roomName).emit("player-validation-updated", {
+        playerId: assignedUserid,
+        validationStatus: validationStatus,
+        validationReason: validationReason
+      });
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("join-info error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
+  // Update room metadata
+  socket.on("update-room-metadata", async (data, cb) => {
+    try {
+      const { roomName, metadata } = data || {};
+      const room = rooms.get(roomName);
+      if (!room) return cb && cb("no such room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      // Update room metadata - support both legacy and new formats
+      if (metadata) {
+        if (metadata.rom) {
+          // New structured format
+          if (!room.metadata) room.metadata = {};
+          if (!room.metadata.rom) room.metadata.rom = {};
+          Object.assign(room.metadata.rom, metadata.rom);
+        }
+        if (metadata.emulator) {
+          if (!room.metadata) room.metadata = {};
+          if (!room.metadata.emulator) room.metadata.emulator = {};
+          Object.assign(room.metadata.emulator, metadata.emulator);
+        }
+
+        // Legacy format support
+        if (metadata.rom_hash !== undefined) room.rom_hash = metadata.rom_hash;
+        if (metadata.core_type !== undefined) room.core_type = metadata.core_type;
+
+        console.log(`[SFU] Updated room ${roomName} metadata:`, metadata);
+      }
+
+      cb && cb(null);
+    } catch (err) {
+      console.error("update-room-metadata error", err);
+      cb && cb(err.message || "error");
+    }
+  });
+
   // Deterministic preload sequence for delay sync rooms
   socket.on("ready-at-frame-1", (data, cb) => {
     try {
@@ -3443,32 +3699,33 @@ io.on("connection", (socket) => {
       const room = rooms.get(roomName);
       if (
         !room ||
-        !room.lobby_state ||
-        room.lobby_state.phase !== "launching"
+        room.netplay_mode !== "delay_sync" ||
+        room.room_phase !== "prepare"
       ) {
-        return cb && cb("not launching");
+        return cb && cb("not in prepare phase");
       }
 
       const assignedUserid = getAssignedUserid();
       if (!assignedUserid) return cb && cb("not authenticated");
 
       // Track ready status for deterministic start
-      if (!room.lobby_state.ready_at_frame_1) {
-        room.lobby_state.ready_at_frame_1 = new Map();
+      if (!room.ready_at_frame_1) {
+        room.ready_at_frame_1 = new Map();
       }
-      room.lobby_state.ready_at_frame_1.set(assignedUserid, true);
+      room.ready_at_frame_1.set(assignedUserid, true);
 
       // Check if all active players are ready
       const activePlayers = Array.from(room.players.values()).filter(
         (p) => !isViewerExtra(p),
       );
       const allReady = activePlayers.every((p) =>
-        room.lobby_state.ready_at_frame_1.get(p.userid),
+        room.ready_at_frame_1.get(p.userid),
       );
 
       if (allReady) {
-        // All players ready - send START signal
-        const startTime = Date.now() + 100; // Start in 100ms
+        // All players ready - transition to running phase and send START signal
+        room.room_phase = "running";
+        const startTime = Date.now() + 2000; // Start in 2 seconds
         io.to(roomName).emit("start-game", {
           frame: frame,
           start_time: startTime,
