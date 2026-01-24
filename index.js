@@ -596,6 +596,7 @@ async function registryUpsertRoom(roomName) {
     room_phase: room.room_phase || "running",
     sync_config: room.sync_config || null,
     spectator_mode: room.spectator_mode || 1,
+    game_id: room.game_id || null,
     // Include metadata for DELAY_SYNC rooms
     metadata: room.metadata || null,
     // Legacy fields for backward compatibility
@@ -680,6 +681,20 @@ app.get("/list", async (req, res) => {
     const out = {};
     const now = Date.now();
     for (const [name, info] of rooms.entries()) {
+      // Debug: log room state for this room
+      if (name === "sdfdsf" || name.includes("sdf")) {
+        console.log(`[HTTP /list] Room ${name} state:`, {
+          netplay_mode: info.netplay_mode,
+          rom_hash: info.rom_hash,
+          rom_name: info.rom_name,
+          core_type: info.core_type,
+          coreId: info.coreId,
+          system: info.system,
+          platform: info.platform,
+          allKeys: Object.keys(info),
+        });
+      }
+
       const webSocketPlayers = countActivePlayers(info);
       const httpJoinedPlayers = info.joinedPlayers
         ? info.joinedPlayers.size
@@ -706,11 +721,21 @@ app.get("/list", async (req, res) => {
         current: currentPlayers,
         max: info.maxPlayers,
         hasPassword: !!info.password,
-        netplay_mode: info.netplay_mode || 0,
+        netplay_mode:
+          info.netplay_mode === "delay_sync" || info.netplay_mode === 1
+            ? "delay_sync"
+            : "live_stream", // Ensure consistent string format
         sync_config: info.sync_config || null,
         spectator_mode: info.spectator_mode || 1,
         rom_hash: info.rom_hash || null,
         core_type: info.core_type || null,
+        rom_name: info.rom_name || null,
+        system: info.system || null,
+        platform: info.platform || null,
+        coreId: info.coreId || null,
+        coreVersion: info.coreVersion || null,
+        romHash: info.romHash || null,
+        systemType: info.systemType || null, // Add missing field
       };
     }
     res.json(out);
@@ -766,7 +791,8 @@ app.post("/create", async (req, res) => {
     }
 
     const roomData = {
-      owner: null, // HTTP-created rooms don't have an immediate owner socket
+      owner: null, // HTTP-created rooms don't have an immediate owner socketi
+      game_id,
       players,
       joinedPlayers, // Track HTTP-joined players
       maxPlayers: max_players,
@@ -779,17 +805,20 @@ app.post("/create", async (req, res) => {
       rom_hash,
       core_type,
       // New structured metadata for DELAY_SYNC
-      metadata: netplay_mode === 1 ? {
-        rom: {
-          displayName: rom_hash || 'Unknown ROM',
-          hash: rom_hash ? { algo: 'sha256', value: rom_hash } : null
-        },
-        emulator: {
-          id: core_type || 'unknown',
-          displayName: core_type || 'Unknown Emulator',
-          coreVersion: null
-        }
-      } : null,
+      metadata:
+        netplay_mode === 1
+          ? {
+              rom: {
+                displayName: rom_hash || "Unknown ROM",
+                hash: rom_hash ? { algo: "sha256", value: rom_hash } : null,
+              },
+              emulator: {
+                id: core_type || "unknown",
+                displayName: core_type || "Unknown Emulator",
+                coreVersion: null,
+              },
+            }
+          : null,
       http_created: true, // Mark as HTTP-created
       created_at: Date.now(),
       chatHistory: [],
@@ -823,6 +852,7 @@ app.post("/create", async (req, res) => {
         netplay_mode,
         sync_config,
         spectator_mode,
+        game_id,
         rom_hash,
         core_type,
       },
@@ -894,6 +924,7 @@ app.post("/join/:roomId", async (req, res) => {
         room_phase: room.room_phase || "running",
         sync_config: room.sync_config || null,
         spectator_mode: room.spectator_mode || 1,
+        game_id: room.game_id || null,
         rom_hash: room.rom_hash || null,
         core_type: room.core_type || null,
       },
@@ -2773,26 +2804,93 @@ io.on("connection", (socket) => {
       } else {
         // Create new room
         const assignedUserid = getAssignedUserid();
+
+        // Extract netplay data from extra (before normalization/auth)
+        const clientNetplayMode =
+          extra.netplay_mode === 1 ? "delay_sync" : "live_stream";
+        const clientRoomPhase =
+          extra.room_phase ||
+          (clientNetplayMode === "delay_sync" ? "lobby" : "running");
+        const romHash = extra.romHash || extra.rom_hash || null;
+        const romName = extra.rom_name || extra.romFilename || null;
+        const coreType = extra.core_type || extra.coreId || null;
+
         room = {
           owner: assignedUserid,
           players: new Map(),
           maxPlayers,
           password,
-          netplay_mode: "live_stream", // Default to live_stream
-          room_phase: "running", // Default to running for backward compatibility
-          sync_config: null,
-          spectator_mode: 1,
-          rom_hash: null,
-          core_type: null,
-          lobby_state: null,
+          netplay_mode: clientNetplayMode,
+          room_phase: clientRoomPhase,
+          sync_config: extra.sync_config || null,
+          spectator_mode:
+            extra.spectator_mode !== undefined ? extra.spectator_mode : 1,
+          game_id: extra.game_id || null,
+          rom_hash: romHash,
+          core_type: coreType,
+          rom_name: romName,
+          system: extra.system || null,
+          platform: extra.platform || null,
+          coreId: coreType,
+          coreVersion: extra.coreVersion || null,
+          romHash: romHash,
+          systemType: extra.systemType || null,
+          lobby_state:
+            clientNetplayMode === "delay_sync"
+              ? {
+                  phase: "waiting",
+                  player_ready: new Map(),
+                }
+              : null,
           chatHistory: [],
-          mutex: new Mutex(), // Mutex for thread-safe slot assignment
+          mutex: new Mutex(),
+          http_created: false,
         };
         rooms.set(roomName, room);
         locallyHostedRooms.add(roomName);
       }
 
       const storedExtra = applyAuthToExtra(normalizeExtra(extra));
+
+      // Debug: log what we received from client
+      console.log(
+        `[SFU] open-room received storedExtra for room ${roomName}:`,
+        {
+          netplay_mode: storedExtra.netplay_mode,
+          romHash: storedExtra.romHash,
+          rom_hash: storedExtra.rom_hash,
+          rom_name: storedExtra.rom_name,
+          romFilename: storedExtra.romFilename,
+          coreId: storedExtra.coreId,
+          core_type: storedExtra.core_type,
+          system: storedExtra.system,
+          platform: storedExtra.platform,
+          allKeys: Object.keys(storedExtra),
+        },
+      );
+
+      // Set room netplay_mode from client data when creating new room (not HTTP-created)
+      if (room && !room.http_created) {
+        const clientMode =
+          storedExtra.netplay_mode === 1 ? "delay_sync" : "live_stream";
+        room.netplay_mode = clientMode;
+        room.room_phase =
+          storedExtra.room_phase ||
+          (clientMode === "delay_sync" ? "lobby" : "running");
+        console.log(
+          `[SFU] Room ${roomName} created with netplay_mode: ${clientMode}, room_phase: ${room.room_phase}`,
+        );
+        console.log(
+          `[SFU] Room ${roomName} creation - ROM metadata received:`,
+          {
+            romHash: storedExtra.romHash || storedExtra.rom_hash,
+            rom_name: storedExtra.rom_name || storedExtra.romFilename,
+            core_type: storedExtra.core_type || storedExtra.coreId,
+            system: storedExtra.system,
+            platform: storedExtra.platform,
+          },
+        );
+      }
 
       // For room creation, ensure the host gets player slot 0
       if (!room.players.has(storedExtra.userid)) {
@@ -2815,20 +2913,40 @@ io.on("connection", (socket) => {
       }
 
       // Update room metadata from extra data
-      if (storedExtra.netplay_mode !== undefined)
-        room.netplay_mode = storedExtra.netplay_mode;
       if (storedExtra.room_phase !== undefined)
         room.room_phase = storedExtra.room_phase;
       if (storedExtra.sync_config !== undefined)
         room.sync_config = storedExtra.sync_config;
       if (storedExtra.spectator_mode !== undefined)
         room.spectator_mode = storedExtra.spectator_mode;
-      if (storedExtra.metadata !== undefined)
-        room.metadata = storedExtra.metadata;
-      if (storedExtra.rom_hash !== undefined)
+      if (storedExtra.rom_name !== undefined)
+        room.rom_name = storedExtra.rom_name;
+      if (storedExtra.romFilename !== undefined && !room.rom_name)
+        room.rom_name = storedExtra.romFilename;
+      if (storedExtra.system !== undefined) room.system = storedExtra.system;
+      if (storedExtra.platform !== undefined)
+        room.platform = storedExtra.platform;
+      if (storedExtra.coreId !== undefined) room.coreId = storedExtra.coreId;
+      if (storedExtra.coreVersion !== undefined)
+        room.coreVersion = storedExtra.coreVersion;
+      // Handle romHash/rom_hash (prefer romHash, fallback to rom_hash)
+      if (storedExtra.romHash !== undefined) {
+        room.romHash = storedExtra.romHash;
+        room.rom_hash = storedExtra.romHash;
+      } else if (storedExtra.rom_hash !== undefined) {
         room.rom_hash = storedExtra.rom_hash;
-      if (storedExtra.core_type !== undefined)
+        room.romHash = storedExtra.rom_hash;
+      }
+      if (storedExtra.systemType !== undefined)
+        room.systemType = storedExtra.systemType;
+      // Handle core_type/coreId (prefer core_type, fallback to coreId)
+      if (storedExtra.core_type !== undefined) {
         room.core_type = storedExtra.core_type;
+        if (!room.coreId) room.coreId = storedExtra.core_type;
+      } else if (storedExtra.coreId !== undefined && !room.core_type) {
+        room.coreId = storedExtra.coreId;
+        room.core_type = storedExtra.coreId;
+      }
 
       // Room assignment: choose a worker using least-loaded strategy and
       // create a dedicated router for this room on that worker.
@@ -2857,10 +2975,31 @@ io.on("connection", (socket) => {
       const roomUsers = listRoomUsers(roomName);
       logger.debug("sending users-updated to room (open-room)", {
         roomName,
+        netplay_mode: room.netplay_mode || "live_stream",
+        room_phase: room.room_phase || "running",
         userCount: Object.keys(roomUsers).length,
         users: roomUsers,
       });
       io.to(roomName).emit("users-updated", roomUsers);
+
+      // Debug: log room state before broadcasting
+      const roomBeforeBroadcast = rooms.get(roomName);
+      if (roomBeforeBroadcast) {
+        console.log(
+          `[SFU] Room ${roomName} state before broadcastRoomList():`,
+          {
+            netplay_mode: roomBeforeBroadcast.netplay_mode,
+            rom_hash: roomBeforeBroadcast.rom_hash,
+            rom_name: roomBeforeBroadcast.rom_name,
+            core_type: roomBeforeBroadcast.core_type,
+            coreId: roomBeforeBroadcast.coreId,
+            system: roomBeforeBroadcast.system,
+            platform: roomBeforeBroadcast.platform,
+          },
+        );
+      }
+
+      broadcastRoomList();
       cb && cb(null);
     } catch (err) {
       console.error("open-room error", err);
@@ -2930,9 +3069,15 @@ io.on("connection", (socket) => {
         return cb && cb("bad password");
       const storedExtra = applyAuthToExtra(normalizeExtra(extra));
 
-      // Validate ROM and core compatibility for player join
+      // Validate ROM and core compatibility for player join (delay_sync only)
       const isSpectatorJoin = storedExtra.is_spectator || false;
-      if (!isSpectatorJoin && room.rom_hash && room.core_type) {
+      // Only perform ROM/core validation for delay_sync rooms, not live_stream
+      if (
+        !isSpectatorJoin &&
+        room.netplay_mode === "delay_sync" &&
+        room.rom_hash &&
+        room.core_type
+      ) {
         // Check if joining client has compatible ROM and core
         const clientRomHash = storedExtra.rom_hash;
         const clientCoreType = storedExtra.core_type;
@@ -2966,6 +3111,89 @@ io.on("connection", (socket) => {
               })
             );
           }
+        }
+      }
+
+      // Strict validation for delay sync rooms - requires exact ROM hash and coreId match
+      if (room.netplay_mode === "delay_sync" && !isSpectatorJoin) {
+        const validationErrors = [];
+
+        // Critical requirements for delay sync: exact ROM hash match (REQUIRED)
+        if (!room.rom_hash) {
+          return (
+            cb &&
+            cb({
+              error: "delay_sync_requirements_not_met",
+              message:
+                "Room host has not provided ROM hash. Delay sync requires exact ROM matching.",
+              canJoinAsSpectator: false,
+            })
+          );
+        }
+
+        if (!storedExtra.rom_hash || storedExtra.rom_hash !== room.rom_hash) {
+          return (
+            cb &&
+            cb({
+              error: "delay_sync_requirements_not_met",
+              message: `ROM hash mismatch: room requires '${room.rom_hash}', client has '${storedExtra.rom_hash || "none"}'. Delay sync requires exact ROM match.`,
+              canJoinAsSpectator: false,
+              compatibilityIssues: [
+                `ROM hash: room requires '${room.rom_hash}', client has '${storedExtra.rom_hash || "none"}'`,
+              ],
+              requiredMetadata: {
+                rom_hash: room.rom_hash,
+                rom_name: room.rom_name,
+                core_type: room.core_type,
+              },
+            })
+          );
+        }
+
+        // Critical requirements for delay sync: exact coreId/core_type match (REQUIRED)
+        if (!room.core_type) {
+          return (
+            cb &&
+            cb({
+              error: "delay_sync_requirements_not_met",
+              message:
+                "Room host has not provided emulator core type. Delay sync requires exact core matching.",
+              canJoinAsSpectator: false,
+            })
+          );
+        }
+
+        if (
+          !storedExtra.core_type ||
+          storedExtra.core_type !== room.core_type
+        ) {
+          return (
+            cb &&
+            cb({
+              error: "delay_sync_requirements_not_met",
+              message: `Emulator core mismatch: room requires '${room.core_type}', client has '${storedExtra.core_type || "none"}'. Delay sync requires exact core match.`,
+              canJoinAsSpectator: false,
+              compatibilityIssues: [
+                `Emulator core: room requires '${room.core_type}', client has '${storedExtra.core_type || "none"}'`,
+              ],
+              requiredMetadata: {
+                rom_hash: room.rom_hash,
+                rom_name: room.rom_name,
+                core_type: room.core_type,
+              },
+            })
+          );
+        }
+
+        // Additional compatibility checks (warnings, not blocking)
+        if (
+          storedExtra.system &&
+          room.system &&
+          storedExtra.system !== room.system
+        ) {
+          console.warn(
+            `[SFU] System mismatch in delay sync room: room=${room.system}, client=${storedExtra.system}`,
+          );
         }
       }
 
@@ -3181,6 +3409,7 @@ io.on("connection", (socket) => {
         users: roomUsers,
         netplay_mode: room.netplay_mode || "live_stream",
         room_phase: room.room_phase || "running",
+        game_id: room.game_id || null,
         sync_config: room.sync_config || null,
       };
 
@@ -3197,10 +3426,12 @@ io.on("connection", (socket) => {
       console.error("join-room error", err);
       cb && cb(err.message || "error");
     }
+    broadcastRoomList();
   });
 
   // Request current room state (for clients that need to sync)
   socket.on("request-room-state", (data, cb) => {
+    broadcastRoomList();
     try {
       const { roomName } = data || {};
       const room = rooms.get(roomName);
@@ -3220,12 +3451,21 @@ io.on("connection", (socket) => {
           users: roomUsers,
           netplay_mode: room.netplay_mode || "live_stream",
           room_phase: room.room_phase || "running",
+          game_id: room.game_id || null,
           sync_config: room.sync_config || null,
         });
     } catch (err) {
       console.error("request-room-state error", err);
       cb && cb(err.message || "error");
     }
+  });
+
+  // Request current room list (for clients connecting or refreshing)
+  socket.on("request-room-list", (data, cb) => {
+    console.log(`[SFU] request-room-list received from socket ${socket.id}`);
+    console.log(`[SFU] Current rooms count: ${rooms.size}`);
+    broadcastRoomList();
+    if (cb) cb(null);
   });
 
   socket.on("leave-room", (data, cb) => {
@@ -3312,6 +3552,7 @@ io.on("connection", (socket) => {
       console.error("leave-room error", err);
       cb && cb(err.message || "error");
     }
+    broadcastRoomList();
   });
 
   // Lobby management for delay sync rooms
@@ -3413,6 +3654,7 @@ io.on("connection", (socket) => {
       console.error("launch-game error", err);
       cb && cb(err.message || "error");
     }
+    broadcastRoomList();
   });
 
   // Player slot updates for delay sync rooms
@@ -3501,6 +3743,7 @@ io.on("connection", (socket) => {
       console.error("update-player-slot error", err);
       cb && cb(err.message || "error");
     }
+    broadcastRoomList();
   });
 
   // DELAY_SYNC: Toggle ready state
@@ -3524,7 +3767,9 @@ io.on("connection", (socket) => {
       // Toggle ready state
       playerExtra.ready = !playerExtra.ready;
 
-      console.log(`[SFU] Player ${assignedUserid} ready state: ${playerExtra.ready}`);
+      console.log(
+        `[SFU] Player ${assignedUserid} ready state: ${playerExtra.ready}`,
+      );
 
       // Broadcast ready state update
       io.to(roomName).emit("player-ready-updated", {
@@ -3590,6 +3835,7 @@ io.on("connection", (socket) => {
       console.error("start-game error", err);
       cb && cb(err.message || "error");
     }
+    broadcastRoomList();
   });
 
   // DELAY_SYNC: Join info with validation data
@@ -3601,6 +3847,21 @@ io.on("connection", (socket) => {
 
       const assignedUserid = getAssignedUserid();
       if (!assignedUserid) return cb && cb("not authenticated");
+
+      // In SFU server join-room handler
+      if (storedExtra.netplay_mode !== undefined) {
+        const clientMode =
+          storedExtra.netplay_mode === 1 ? "delay_sync" : "live_stream";
+        if (clientMode !== room.netplay_mode) {
+          return (
+            cb &&
+            cb({
+              error: "mode_mismatch",
+              message: `Room is ${room.netplay_mode} but client expects ${clientMode}`,
+            })
+          );
+        }
+      }
 
       // Only validate for DELAY_SYNC rooms
       if (room.netplay_mode !== "delay_sync") {
@@ -3617,7 +3878,7 @@ io.on("connection", (socket) => {
       if (room.metadata && room.metadata.rom && room.metadata.rom.hash) {
         if (!romHash || romHash !== room.metadata.rom.hash.value) {
           validationStatus = "rom_mismatch";
-          validationReason = `ROM mismatch: host is using ${room.metadata.rom.displayName || 'Unknown ROM'}`;
+          validationReason = `ROM mismatch: host is using ${room.metadata.rom.displayName || "Unknown ROM"}`;
         }
       }
 
@@ -3627,8 +3888,11 @@ io.on("connection", (socket) => {
           validationReason = `Emulator mismatch: host is using ${room.metadata.emulator.displayName || room.metadata.emulator.id}`;
         }
         // Optional version check
-        if (emulatorVersion && room.metadata.emulator.coreVersion &&
-            emulatorVersion !== room.metadata.emulator.coreVersion) {
+        if (
+          emulatorVersion &&
+          room.metadata.emulator.coreVersion &&
+          emulatorVersion !== room.metadata.emulator.coreVersion
+        ) {
           validationStatus = "version_mismatch";
           validationReason = `Core version mismatch: host is using ${room.metadata.emulator.coreVersion}`;
         }
@@ -3638,13 +3902,16 @@ io.on("connection", (socket) => {
       playerExtra.validationStatus = validationStatus;
       playerExtra.validationReason = validationReason;
 
-      console.log(`[SFU] Player ${assignedUserid} validation: ${validationStatus}`, validationReason ? `(${validationReason})` : '');
+      console.log(
+        `[SFU] Player ${assignedUserid} validation: ${validationStatus}`,
+        validationReason ? `(${validationReason})` : "",
+      );
 
       // Broadcast validation status update
       io.to(roomName).emit("player-validation-updated", {
         playerId: assignedUserid,
         validationStatus: validationStatus,
-        validationReason: validationReason
+        validationReason: validationReason,
       });
 
       cb && cb(null);
@@ -3652,10 +3919,66 @@ io.on("connection", (socket) => {
       console.error("join-info error", err);
       cb && cb(err.message || "error");
     }
+    broadcastRoomList();
   });
 
   // Update room metadata
   socket.on("update-room-metadata", async (data, cb) => {
+    try {
+      // Define metadata object
+      const { roomName, metadata } = data || {};
+      // Get room from rooms map
+      const room = rooms.get(roomName);
+      if (!room) return cb && cb("no such room");
+
+      const assignedUserid = getAssignedUserid();
+      if (!assignedUserid) return cb && cb("not authenticated");
+
+      if (metadata) {
+        if (metadata.rom_name !== undefined) room.rom_name = metadata.rom_name;
+        if (metadata.core_type !== undefined)
+          room.core_type = metadata.core_type;
+        if (metadata.system !== undefined) room.system = metadata.system;
+        if (metadata.platform !== undefined) room.platform = metadata.platform;
+        if (metadata.coreId !== undefined) room.coreId = metadata.coreId;
+        if (metadata.coreVersion !== undefined)
+          room.coreVersion = metadata.coreVersion;
+        if (metadata.romHash !== undefined) {
+          room.romHash = metadata.romHash;
+          // Also set rom_hash for backward compatibility
+          if (!room.rom_hash) room.rom_hash = metadata.romHash;
+        }
+        if (metadata.systemType !== undefined)
+          room.systemType = metadata.systemType;
+        if (metadata.netplay_mode !== undefined) {
+          room.netplay_mode = metadata.netplay_mode;
+        }
+        // Ensure rom_hash is set if romHash exists
+        if (room.romHash && !room.rom_hash) {
+          room.rom_hash = room.romHash;
+        }
+        // Ensure core_type is set if coreId exists
+        if (room.coreId && !room.core_type) {
+          room.core_type = room.coreId;
+        }
+      }
+
+      console.log(`[SFU] Updated room ${roomName} metadata:`, metadata);
+      console.log(`[SFU] Room ${roomName} state after update:`, {
+        netplay_mode: room.netplay_mode,
+        rom_hash: room.rom_hash,
+        rom_name: room.rom_name,
+        core_type: room.core_type,
+      });
+    } catch (err) {
+      console.error("update-room-metadata error", err);
+      cb && cb(err.message || "error");
+    }
+    broadcastRoomList();
+  });
+
+  // Update player metadata (emulator/core info)
+  socket.on("update-player-metadata", async (data, cb) => {
     try {
       const { roomName, metadata } = data || {};
       const room = rooms.get(roomName);
@@ -3664,32 +3987,44 @@ io.on("connection", (socket) => {
       const assignedUserid = getAssignedUserid();
       if (!assignedUserid) return cb && cb("not authenticated");
 
-      // Update room metadata - support both legacy and new formats
-      if (metadata) {
-        if (metadata.rom) {
-          // New structured format
-          if (!room.metadata) room.metadata = {};
-          if (!room.metadata.rom) room.metadata.rom = {};
-          Object.assign(room.metadata.rom, metadata.rom);
-        }
-        if (metadata.emulator) {
-          if (!room.metadata) room.metadata = {};
-          if (!room.metadata.emulator) room.metadata.emulator = {};
-          Object.assign(room.metadata.emulator, metadata.emulator);
+      // Get and update player metadata
+      const playerExtra = room.players.get(assignedUserid);
+      if (playerExtra) {
+        // Initialize metadata object if it doesn't exist
+        if (!playerExtra.metadata) {
+          playerExtra.metadata = {};
         }
 
-        // Legacy format support
-        if (metadata.rom_hash !== undefined) room.rom_hash = metadata.rom_hash;
-        if (metadata.core_type !== undefined) room.core_type = metadata.core_type;
+        // Update metadata fields
+        if (metadata) {
+          Object.assign(playerExtra.metadata, metadata);
+          // Handle netplay_mode separately (top-level player property)
+          if (metadata.netplay_mode !== undefined) {
+            playerExtra.netplay_mode = metadata.netplay_mode;
+            // Remove from metadata object to avoid duplication
+            const { netplay_mode, ...metadataWithoutNetplayMode } = metadata;
+            Object.assign(playerExtra.metadata, metadataWithoutNetplayMode);
+          } else {
+            Object.assign(playerExtra.metadata, metadata);
+          }
+        }
 
-        console.log(`[SFU] Updated room ${roomName} metadata:`, metadata);
+        console.log(
+          `[SFU] Updated player ${assignedUserid} metadata in room ${roomName}:`,
+          metadata,
+        );
+
+        // Broadcast updated player list to all clients in the room
+        const roomUsers = listRoomUsers(roomName);
+        io.to(roomName).emit("users-updated", roomUsers);
       }
 
       cb && cb(null);
     } catch (err) {
-      console.error("update-room-metadata error", err);
+      console.error("update-player-metadata error", err);
       cb && cb(err.message || "error");
     }
+    broadcastRoomList();
   });
 
   // Deterministic preload sequence for delay sync rooms
@@ -4227,6 +4562,56 @@ io.on("connection", (socket) => {
     peers.delete(socket.id);
   });
 });
+
+// Add helper function to broadcast room updates
+function broadcastRoomList() {
+  const roomList = Array.from(rooms.entries()).map(([roomName, room]) => ({
+    id: roomName, // Use roomName as id
+    name: roomName, // Use roomName as name
+    current: room.players.size,
+    max: room.maxPlayers,
+    hasPassword: !!room.password,
+    netplay_mode: room.netplay_mode || "live_stream",
+    rom_hash: room.rom_hash || null,
+    core_type: room.core_type || null,
+    system: room.system || null,
+    platform: room.platform || null,
+    coreId: room.coreId || null,
+    coreVersion: room.coreVersion || null,
+    romHash: room.romHash || null,
+    systemType: room.systemType || null,
+    rom_name: room.rom_name || null,
+  }));
+
+  // Debug: log what we're broadcasting
+  if (roomList.length > 0) {
+    console.log("[SFU] Broadcasting room list update:", {
+      roomCount: roomList.length,
+      firstRoom: {
+        id: roomList[0].id,
+        netplay_mode: roomList[0].netplay_mode,
+        rom_name: roomList[0].rom_name,
+        rom_hash: roomList[0].rom_hash,
+        core_type: roomList[0].core_type,
+      },
+    });
+  }
+  console.log(
+    `[SFU] broadcastRoomList: Emitting rooms-updated to all clients with ${roomList.length} rooms`,
+  );
+  if (roomList.length > 0) {
+    console.log(`[SFU] broadcastRoomList: First room in broadcast:`, {
+      id: roomList[0].id,
+      netplay_mode: roomList[0].netplay_mode,
+      rom_name: roomList[0].rom_name,
+      core_type: roomList[0].core_type,
+    });
+  }
+  io.emit("rooms-updated", roomList); // Broadcast to ALL connected clients
+  console.log(
+    `[SFU] broadcastRoomList: rooms-updated event emitted via io.emit()`,
+  );
+}
 
 runMediasoup()
   .then(() => initRoomRegistry())
