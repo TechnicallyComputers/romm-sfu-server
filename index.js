@@ -4565,23 +4565,41 @@ io.on("connection", (socket) => {
 
 // Add helper function to broadcast room updates
 function broadcastRoomList() {
-  const roomList = Array.from(rooms.entries()).map(([roomName, room]) => ({
-    id: roomName, // Use roomName as id
-    name: roomName, // Use roomName as name
-    current: room.players.size,
-    max: room.maxPlayers,
-    hasPassword: !!room.password,
-    netplay_mode: room.netplay_mode || "live_stream",
-    rom_hash: room.rom_hash || null,
-    core_type: room.core_type || null,
-    system: room.system || null,
-    platform: room.platform || null,
-    coreId: room.coreId || null,
-    coreVersion: room.coreVersion || null,
-    romHash: room.romHash || null,
-    systemType: room.systemType || null,
-    rom_name: room.rom_name || null,
-  }));
+  const now = Date.now();
+  const roomList = Array.from(rooms.entries())
+    .map(([roomName, room]) => {
+      // Use countActivePlayers to exclude spectators (consistent with HTTP /list endpoint)
+      const currentPlayers = countActivePlayers(room);
+      const isEmpty = currentPlayers === 0;
+      const ageMinutes = (now - (room.created_at || 0)) / (1000 * 60);
+      
+      // Filter out empty rooms that are older than grace period
+      // Keep HTTP-created rooms for 30 seconds, WebSocket-created for 1 minute
+      // This gives a brief grace period for reconnection but removes stale empty rooms quickly
+      const keepMinutes = room.http_created ? 0.5 : 1; // 30 seconds for HTTP, 1 minute for WebSocket
+      if (isEmpty && ageMinutes > keepMinutes) {
+        return null; // Filter out old empty rooms
+      }
+      
+      return {
+        id: roomName, // Use roomName as id
+        name: roomName, // Use roomName as name
+        current: currentPlayers, // Use countActivePlayers instead of room.players.size
+        max: room.maxPlayers,
+        hasPassword: !!room.password,
+        netplay_mode: room.netplay_mode || "live_stream",
+        rom_hash: room.rom_hash || null,
+        core_type: room.core_type || null,
+        system: room.system || null,
+        platform: room.platform || null,
+        coreId: room.coreId || null,
+        coreVersion: room.coreVersion || null,
+        romHash: room.romHash || null,
+        systemType: room.systemType || null,
+        rom_name: room.rom_name || null,
+      };
+    })
+    .filter((room) => room !== null); // Remove filtered-out rooms
 
   // Debug: log what we're broadcasting
   if (roomList.length > 0) {
