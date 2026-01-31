@@ -3319,6 +3319,12 @@ io.on("connection", (socket) => {
       room.players.set(storedExtra.userid, storedExtra);
       socket.join(roomName);
 
+      // Update room owner if this is a reconnect and the old socket was the owner
+      if (isReconnect && existingExtra && existingExtra.socketId === room.owner) {
+        room.owner = socket.id;
+        console.log(`[SFU] Updated room owner for ${roomName} to ${socket.id} on reconnect`);
+      }
+
       // Assign this socket to a worker for this room.
       // Persistence: once assigned, the socket stays on that worker for all SFU operations.
       try {
@@ -4133,6 +4139,7 @@ io.on("connection", (socket) => {
     try {
       const roomName = data.roomName || getSocketRoomName();
       const target = data.target || data.targetSocketId;
+      console.log(`webrtc-signal received: roomName=${roomName}, target=${target}, sender=${socket.id}`);
       if (!target) return;
 
       let targetSocketId = null;
@@ -4142,27 +4149,47 @@ io.on("connection", (socket) => {
         targetSocketId = target;
       } else if (roomName) {
         const room = rooms.get(roomName);
+        console.log(`Room lookup: roomName=${roomName}, room exists=${!!room}, room.owner=${room?.owner}`);
         if (target === "host") {
           // Special case: "host" resolves to the room owner
           targetSocketId = room && room.owner;
-        } else {
-          // Fallback: treat target as a userid and resolve to socketId.
-          const extra = room && room.players.get(target);
-          const resolved = extra && (extra.socketId || extra.socket_id);
-          if (resolved && io.sockets.sockets.get(resolved)) {
-            targetSocketId = resolved;
+          console.log(`Host target resolved: targetSocketId=${targetSocketId}`);
+          // If owner is not connected, transfer ownership
+          if (targetSocketId && !io.sockets.sockets.get(targetSocketId)) {
+            console.log(`Owner socket ${targetSocketId} not connected, transferring ownership`);
+            if (room.players.size > 0) {
+              const firstPlayer = room.players.values().next().value;
+              if (firstPlayer && firstPlayer.socketId && io.sockets.sockets.get(firstPlayer.socketId)) {
+                room.owner = firstPlayer.socketId;
+                targetSocketId = room.owner;
+                console.log(`Ownership transferred to ${targetSocketId}`);
+              } else {
+                console.log(`No valid player to transfer ownership to`);
+                targetSocketId = null;
+              }
+            } else {
+              console.log(`No players in room, cannot transfer ownership`);
+              targetSocketId = null;
+            }
           }
         }
       }
 
-      if (!targetSocketId) return;
+      if (!targetSocketId) {
+        console.log(`No targetSocketId found, skipping relay`);
+        return;
+      }
 
       // Basic sanity check: ensure both sockets are in the same room (if known).
       if (roomName) {
         const targetSock = io.sockets.sockets.get(targetSocketId);
-        if (!targetSock || !targetSock.rooms.has(roomName)) return;
+        if (!targetSock || !targetSock.rooms.has(roomName)) {
+          console.log(`Sanity check failed: targetSock exists=${!!targetSock}, target in room=${targetSock?.rooms.has(roomName)}`);
+          return;
+        }
       }
 
+      console.log(`Relaying webrtc-signal to targetSocketId=${targetSocketId}`);
       io.to(targetSocketId).emit("webrtc-signal", {
         sender: socket.id,
         offer: data.offer,
@@ -4497,18 +4524,7 @@ io.on("connection", (socket) => {
 
     // Remove from any rooms and notify members.
     for (const [roomName, room] of rooms.entries()) {
-      if (room.owner === socket.id) {
-        rooms.delete(roomName);
-        locallyHostedRooms.delete(roomName);
-        cleanupRoomMediasoup(roomName);
-        if (ENABLE_ROOM_REGISTRY) {
-          registryDeleteRoom(roomName).catch((e) => {
-            logger.warn("failed to delete room registry", e);
-          });
-        }
-        io.to(roomName).emit("users-updated", {});
-        continue;
-      }
+      let wasOwner = room.owner === socket.id;
       let removedUserid = null;
       for (const [uid, extra] of room.players.entries()) {
         if (
@@ -4518,6 +4534,40 @@ io.on("connection", (socket) => {
           room.players.delete(uid);
           removedUserid = uid;
           break;
+        }
+      }
+      if (wasOwner) {
+        if (room.players.size > 0) {
+          // Transfer ownership to another player
+          const firstPlayer = room.players.values().next().value;
+          if (firstPlayer && firstPlayer.socketId) {
+            room.owner = firstPlayer.socketId;
+            logger.debug(`Transferred ownership in room ${roomName} to ${room.owner}`);
+          } else {
+            // Fallback, delete room
+            rooms.delete(roomName);
+            locallyHostedRooms.delete(roomName);
+            cleanupRoomMediasoup(roomName);
+            if (ENABLE_ROOM_REGISTRY) {
+              registryDeleteRoom(roomName).catch((e) => {
+                logger.warn("failed to delete room registry", e);
+              });
+            }
+            io.to(roomName).emit("users-updated", {});
+            continue;
+          }
+        } else {
+          // No players left, delete room
+          rooms.delete(roomName);
+          locallyHostedRooms.delete(roomName);
+          cleanupRoomMediasoup(roomName);
+          if (ENABLE_ROOM_REGISTRY) {
+            registryDeleteRoom(roomName).catch((e) => {
+              logger.warn("failed to delete room registry", e);
+            });
+          }
+          io.to(roomName).emit("users-updated", {});
+          continue;
         }
       }
       if (removedUserid) {
