@@ -392,7 +392,7 @@ function parseTurnServersFromJsonEnv() {
       );
       continue;
     }
-    out.push({ urls: normalizedUrls, username, credential });
+    out.push({ urls: normalizedUrls.length === 1 ? normalizedUrls[0] : normalizedUrls, username, credential });
   }
 
   return out;
