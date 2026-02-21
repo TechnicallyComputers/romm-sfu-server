@@ -393,8 +393,7 @@ function parseTurnServersFromJsonEnv() {
       continue;
     }
     out.push({ urls: normalizedUrls.length === 1 ? normalizedUrls[0] : normalizedUrls, username, credential });
-  }
-
+  }s
   return out;
 }
 
@@ -724,6 +723,8 @@ app.get("/list", async (req, res) => {
         netplay_mode:
           info.netplay_mode === "delay_sync" || info.netplay_mode === 1
             ? "delay_sync"
+            : info.netplay_mode === "arcade" || info.netplay_mode === 2
+            ? "arcade"
             : "live_stream", // Ensure consistent string format
         sync_config: info.sync_config || null,
         spectator_mode: info.spectator_mode || 1,
