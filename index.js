@@ -670,9 +670,34 @@ app.use(express.json());
 // Simple HTTP endpoint used by clients to list available rooms.
 // Strict auth: must present a RoMM-issued JWT and it must be allowlisted by RomM.
 // If the RomM room registry is enabled, this is a cluster-wide list.
+// Set DEBUG_LOG_PATH to a writable path (e.g. mounted volume) when SFU runs in container
+const DEBUG_LOG_PATH = process.env.DEBUG_LOG_PATH || "/tmp/debug-d4e756.log";
+function debugLog(payload) {
+  try {
+    const line =
+      JSON.stringify({ ...payload, timestamp: Date.now(), hypothesisId: "C" }) +
+      "\n";
+    require("fs").appendFileSync(DEBUG_LOG_PATH, line);
+  } catch (_) {}
+}
+
 app.get("/list", async (req, res) => {
   try {
     const token = pickSfuAuthTokenFromHttp(req);
+    let tokenSource = "none";
+    if (req.query && typeof req.query.token === "string") tokenSource = "query";
+    else if (req.headers?.authorization?.match(/^\s*Bearer\s+/i))
+      tokenSource = "header";
+    else if (
+      req.headers?.cookie &&
+      /romm_sfu_token|sfu_token/.test(req.headers.cookie)
+    )
+      tokenSource = "cookie";
+    debugLog({
+      location: "romm-sfu-server:/list",
+      message: "auth received",
+      data: { hasToken: !!token, tokenSource },
+    });
     await verifySfuTokenViaRomm(token, { consume: false });
 
     if (ENABLE_ROOM_REGISTRY) {
@@ -1883,7 +1908,6 @@ io.on("connection", (socket) => {
         "-" +
         authUserid.substring(20, 36);
       bindUseridToSocket(authUserid);
-
     }
   } catch (e) {
     logger.warn("disconnecting unauthorized socket", {
@@ -3674,7 +3698,29 @@ io.on("connection", (socket) => {
       const room = rooms.get(roomName);
       if (!room) return cb && cb("no such room");
       // #region agent log
-      fetch('http://127.0.0.1:7242/ingest/22e800bc-6bc6-4492-ae2b-c74b05fdebc4',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d4e756'},body:JSON.stringify({sessionId:'d4e756',location:'romm-sfu-server/index.js:leave-room',message:'leave-room received',data:{socketId:socket.id,roomName,playersBefore:Array.from(room.players.keys()),userid:getAssignedUserid()},timestamp:Date.now(),hypothesisId:'B'})}).catch(()=>{});
+      fetch(
+        "http://127.0.0.1:7242/ingest/22e800bc-6bc6-4492-ae2b-c74b05fdebc4",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Debug-Session-Id": "d4e756",
+          },
+          body: JSON.stringify({
+            sessionId: "d4e756",
+            location: "romm-sfu-server/index.js:leave-room",
+            message: "leave-room received",
+            data: {
+              socketId: socket.id,
+              roomName,
+              playersBefore: Array.from(room.players.keys()),
+              userid: getAssignedUserid(),
+            },
+            timestamp: Date.now(),
+            hypothesisId: "B",
+          }),
+        },
+      ).catch(() => {});
       // #endregion
 
       // Update per-room worker accounting.
