@@ -73,8 +73,7 @@ const SFU_REQUIRE_BINARY_DATA_CHANNEL =
   process.env.SFU_REQUIRE_BINARY_DATA_CHANNEL !== "0";
 
 // Optional: Validate client RTP layering policy (does not modify sender behavior).
-// These guards are useful to catch older clients that still publish 3-layer simulcast
-// or VP9 without the expected SVC mode.
+// Supported VP9 SVC modes: L1T1, L1T2, L2T2.
 const SFU_EXPECT_VP9_SVC_MODE = process.env.SFU_EXPECT_VP9_SVC_MODE
   ? String(process.env.SFU_EXPECT_VP9_SVC_MODE).toUpperCase()
   : null;
@@ -392,8 +391,12 @@ function parseTurnServersFromJsonEnv() {
       );
       continue;
     }
-    out.push({ urls: normalizedUrls.length === 1 ? normalizedUrls[0] : normalizedUrls, username, credential });
-  }s
+    out.push({
+      urls: normalizedUrls.length === 1 ? normalizedUrls[0] : normalizedUrls,
+      username,
+      credential,
+    });
+  }
   return out;
 }
 
@@ -724,8 +727,8 @@ app.get("/list", async (req, res) => {
           info.netplay_mode === "delay_sync" || info.netplay_mode === 1
             ? "delay_sync"
             : info.netplay_mode === "arcade" || info.netplay_mode === 2
-            ? "arcade"
-            : "live_stream", // Ensure consistent string format
+              ? "arcade"
+              : "live_stream", // Ensure consistent string format
         sync_config: info.sync_config || null,
         spectator_mode: info.spectator_mode || 1,
         rom_hash: info.rom_hash || null,
@@ -1114,6 +1117,10 @@ const SFU_AUTH_TAKEOVER_GRACE_SECONDS = (() => {
 // mobile network transitions.
 const SFU_AUTH_TAKEOVER_MIN_INACTIVE_SECONDS = 1;
 
+// Disconnect grace window: when a socket disconnects (e.g. network switch),
+// keep transports and room slot for this duration to allow reconnection.
+const DISCONNECT_GRACE_SECONDS = 60;
+
 // Auth is verified by calling back into RomM (server-to-server), which checks
 // JWT signature + Redis-backed JTI allowlist.
 
@@ -1305,6 +1312,92 @@ io.use(async (socket, next) => {
 const peers = new Map(); // socketId -> { transports: Map, producers: Map }
 const rooms = new Map(); // roomName -> { owner: socketId, players: Map(userid->extra), maxPlayers, password }
 
+// Disconnect grace window: userid -> { peer, roomName, timerId, disconnectedAt }
+// Keeps transports and room slot for DISCONNECT_GRACE_SECONDS to allow reconnection.
+const disconnectedPeers = new Map();
+
+function buildRoomUsersForEmit(roomName) {
+  const room = rooms.get(roomName);
+  if (!room) return {};
+  const users = {};
+  for (const [uid, extra] of room.players.entries()) {
+    const clientExtra = { ...extra };
+    if (extra.userid === room.owner) clientExtra.is_host = true;
+    delete clientExtra.player_name;
+    if (extra.disconnectedAt) clientExtra.reconnecting = true;
+    users[uid] = clientExtra;
+  }
+  return users;
+}
+
+function cleanupDisconnectedPeer(userid, isReconnect = false) {
+  const entry = disconnectedPeers.get(userid);
+  if (!entry) return;
+  if (entry.timerId) {
+    clearTimeout(entry.timerId);
+    entry.timerId = null;
+  }
+  // When isReconnect: don't close transports here. The client's recreateMediasoupSession
+  // will close its end first; mediasoup will then close server transports via dtlsstatechange.
+  // Closing here would kill the stream before the client creates new transports.
+  if (!isReconnect) {
+    try {
+      const p = entry.peer;
+      if (p) {
+        for (const transport of p.transports.values()) transport.close();
+        for (const producer of p.producers.values()) producer.close();
+        for (const consumer of p.consumers.values()) consumer.close();
+        if (p.dataProducers)
+          for (const dp of p.dataProducers.values()) dp.close();
+        if (p.dataConsumers)
+          for (const dc of p.dataConsumers.values()) dc.close();
+      }
+    } catch (e) {
+      logger.warn("disconnect grace cleanup error", { userid, error: e });
+    }
+  }
+  disconnectedPeers.delete(userid);
+
+  if (!isReconnect) {
+    const room = rooms.get(entry.roomName);
+    if (room) {
+      const roomUserExtra = room.players.get(userid);
+      const wasOwner =
+        roomUserExtra &&
+        (roomUserExtra.socketId === room.owner ||
+          roomUserExtra.socket_id === room.owner);
+      room.players.delete(userid);
+      if (wasOwner && room.players.size > 0) {
+        const firstPlayer = room.players.values().next().value;
+        if (firstPlayer && (firstPlayer.socketId || firstPlayer.socket_id)) {
+          room.owner = firstPlayer.socketId || firstPlayer.socket_id;
+          logger.debug("grace window expiry: transferred ownership", {
+            room: entry.roomName,
+            newOwner: room.owner,
+          });
+        }
+      }
+      const roomUsers = buildRoomUsersForEmit(entry.roomName);
+      io.to(entry.roomName).emit("users-updated", roomUsers);
+      io.to(entry.roomName).emit("room-player-left", { userid });
+      if (room.players.size === 0) {
+        rooms.delete(entry.roomName);
+        locallyHostedRooms.delete(entry.roomName);
+        cleanupRoomMediasoup(entry.roomName);
+        if (ENABLE_ROOM_REGISTRY) {
+          registryDeleteRoom(entry.roomName).catch((e) =>
+            logger.warn("failed to delete room registry", e),
+          );
+        }
+      } else if (ENABLE_ROOM_REGISTRY) {
+        registryUpsertRoom(entry.roomName).catch((e) =>
+          logger.warn("failed to upsert room registry", e),
+        );
+      }
+    }
+  }
+}
+
 // mediasoup runtime state
 // Worker pool allows vertical scaling on multi-core systems.
 // Each worker has its own WebRtcServer (port = WEBRTC_PORT + idx).
@@ -1333,15 +1426,8 @@ const mediaCodecs = [
       stereo: 1,
     },
   },
-  // Codec order matters for client Auto preference.
-  // Present VP9 first, then H264, then VP8.
+  // VP9 only (H.264 and VP8 removed). SVC modes: L1T1, L1T2, L2T2.
   { mimeType: "video/VP9", clockRate: 90000 },
-  {
-    mimeType: "video/H264",
-    clockRate: 90000,
-    parameters: { "packetization-mode": 1 },
-  },
-  { mimeType: "video/VP8", clockRate: 90000 },
 ];
 
 function getOrCreateRoomState(roomName) {
@@ -1797,6 +1883,7 @@ io.on("connection", (socket) => {
         "-" +
         authUserid.substring(20, 36);
       bindUseridToSocket(authUserid);
+
     }
   } catch (e) {
     logger.warn("disconnecting unauthorized socket", {
@@ -1943,9 +2030,21 @@ io.on("connection", (socket) => {
       });
 
       transport.on("dtlsstatechange", (dtlsState) => {
+        console.log(`[SFU] transport ${transport.id} dtlsstatechange:`, {
+          socket: socket.id,
+          direction,
+          dtlsState,
+        });
         if (dtlsState === "closed") {
           transport.close();
         }
+      });
+      transport.on("icestatechange", (iceState) => {
+        console.log(`[SFU] transport ${transport.id} icestatechange:`, {
+          socket: socket.id,
+          direction,
+          iceState,
+        });
       });
 
       const info = {
@@ -1970,6 +2069,15 @@ io.on("connection", (socket) => {
         const transport = peers.get(socket.id).transports.get(transportId);
         if (!transport) throw new Error("transport not found");
         await transport.connect({ dtlsParameters });
+        console.log(
+          `[SFU] sfu-connect-transport: connect() completed (ICE/DTLS negotiation is async)`,
+          {
+            socket: socket.id,
+            transportId,
+            iceState: transport.iceState,
+            dtlsState: transport.dtlsState,
+          },
+        );
         cb && cb(null, true);
       } catch (err) {
         console.error("sfu-connect-transport error", err);
@@ -1981,10 +2089,23 @@ io.on("connection", (socket) => {
   // ICE restart support for clients that experience network path changes.
   // Client calls this when its mediasoup-client Transport connectionState becomes "failed".
   // Server responds with fresh iceParameters from transport.restartIce().
+  // Note: If the client's socket disconnected and reconnected, the peer was deleted
+  // and transports are gone; ICE restart will fail with "transport not found".
   socket.on("sfu-restart-ice", async ({ transportId }, cb) => {
     try {
-      const transport = peers.get(socket.id).transports.get(transportId);
-      if (!transport) throw new Error("transport not found");
+      let peer = peers.get(socket.id);
+      if (!peer) throw new Error("peer not found");
+
+      const transport = peer.transports.get(transportId);
+      if (!transport) {
+        const availableIds = Array.from(peer.transports.keys());
+        console.error("sfu-restart-ice: transport not found", {
+          socketId: socket.id,
+          transportId,
+          availableTransportIds: availableIds,
+        });
+        throw new Error("transport not found");
+      }
       if (transport.closed) throw new Error("transport closed");
 
       const iceParameters = await transport.restartIce();
@@ -1995,6 +2116,42 @@ io.on("connection", (socket) => {
       cb && cb(null, { iceParameters });
     } catch (err) {
       console.error("sfu-restart-ice error", err);
+      cb && cb(err.message);
+    }
+  });
+
+  // Full mediasoup session recreate: close all transports for this peer.
+  // Client calls this when switching networks (WiFi <-> cellular) to tear down
+  // stale transports and create fresh ones. Keeps peer identity; clears mediasoup state.
+  socket.on("sfu-recreate-transports", (data, cb) => {
+    try {
+      const peer = peers.get(socket.id);
+      if (!peer) {
+        cb && cb(null, { ok: true });
+        return;
+      }
+
+      // Close all transports (producers/consumers close automatically)
+      for (const transport of peer.transports.values()) {
+        try {
+          transport.close();
+        } catch (e) {
+          // ignore
+        }
+      }
+      peer.transports.clear();
+      peer.producers.clear();
+      peer.consumers.clear();
+      if (peer.dataProducers) peer.dataProducers.clear();
+      if (peer.dataConsumers) peer.dataConsumers.clear();
+
+      logger.info("sfu-recreate-transports: cleared mediasoup state", {
+        socketId: socket.id,
+        userid: peer.userid,
+      });
+      cb && cb(null, { ok: true });
+    } catch (err) {
+      console.error("sfu-recreate-transports error", err);
       cb && cb(err.message);
     }
   });
@@ -2645,11 +2802,27 @@ io.on("connection", (socket) => {
 
       const room = rooms.get(roomName);
       const socketIds = new Set();
-      if (room && room.owner) socketIds.add(room.owner);
       if (room && room.players) {
         for (const extra of room.players.values()) {
           if (extra && (extra.socketId || extra.socket_id)) {
             socketIds.add(extra.socketId || extra.socket_id);
+          }
+        }
+        // Resolve room.owner to socketId when it's a userid (peers are keyed by socketId)
+        if (room.owner) {
+          const ownerExtra = Array.from(room.players.values()).find(
+            (e) =>
+              e &&
+              (e.userid === room.owner ||
+                e.socketId === room.owner ||
+                e.socket_id === room.owner),
+          );
+          const ownerSid =
+            ownerExtra && (ownerExtra.socketId || ownerExtra.socket_id);
+          if (ownerSid) {
+            socketIds.add(ownerSid);
+          } else if (peers.has(room.owner)) {
+            socketIds.add(room.owner);
           }
         }
       }
@@ -3276,6 +3449,20 @@ io.on("connection", (socket) => {
         existingSid !== socket.id &&
         io.sockets.sockets.get(existingSid);
 
+      // Reconnect from disconnect grace window: cancel timer and close old transports
+      if (
+        isReconnect &&
+        !existingSockAlive &&
+        disconnectedPeers.has(storedExtra.userid)
+      ) {
+        cleanupDisconnectedPeer(storedExtra.userid, true);
+        logger.info("reconnect within grace window", {
+          room: roomName,
+          userid: storedExtra.userid,
+          newSocketId: socket.id,
+        });
+      }
+
       // Mobile network switching can create a brief overlap where the old Socket.IO
       // connection is still alive while the client has already reconnected.
       // When auth is enabled, we can safely allow an immediate takeover by the same
@@ -3321,9 +3508,15 @@ io.on("connection", (socket) => {
       socket.join(roomName);
 
       // Update room owner if this is a reconnect and the old socket was the owner
-      if (isReconnect && existingExtra && existingExtra.socketId === room.owner) {
+      if (
+        isReconnect &&
+        existingExtra &&
+        existingExtra.socketId === room.owner
+      ) {
         room.owner = socket.id;
-        console.log(`[SFU] Updated room owner for ${roomName} to ${socket.id} on reconnect`);
+        console.log(
+          `[SFU] Updated room owner for ${roomName} to ${socket.id} on reconnect`,
+        );
       }
 
       // Assign this socket to a worker for this room.
@@ -3480,6 +3673,9 @@ io.on("connection", (socket) => {
       const { roomName } = data || {};
       const room = rooms.get(roomName);
       if (!room) return cb && cb("no such room");
+      // #region agent log
+      fetch('http://127.0.0.1:7242/ingest/22e800bc-6bc6-4492-ae2b-c74b05fdebc4',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'d4e756'},body:JSON.stringify({sessionId:'d4e756',location:'romm-sfu-server/index.js:leave-room',message:'leave-room received',data:{socketId:socket.id,roomName,playersBefore:Array.from(room.players.keys()),userid:getAssignedUserid()},timestamp:Date.now(),hypothesisId:'B'})}).catch(()=>{});
+      // #endregion
 
       // Update per-room worker accounting.
       try {
@@ -4140,7 +4336,9 @@ io.on("connection", (socket) => {
     try {
       const roomName = data.roomName || getSocketRoomName();
       const target = data.target || data.targetSocketId;
-      console.log(`webrtc-signal received: roomName=${roomName}, target=${target}, sender=${socket.id}`);
+      console.log(
+        `webrtc-signal received: roomName=${roomName}, target=${target}, sender=${socket.id}`,
+      );
       if (!target) return;
 
       let targetSocketId = null;
@@ -4150,17 +4348,25 @@ io.on("connection", (socket) => {
         targetSocketId = target;
       } else if (roomName) {
         const room = rooms.get(roomName);
-        console.log(`Room lookup: roomName=${roomName}, room exists=${!!room}, room.owner=${room?.owner}`);
+        console.log(
+          `Room lookup: roomName=${roomName}, room exists=${!!room}, room.owner=${room?.owner}`,
+        );
         if (target === "host") {
           // Special case: "host" resolves to the room owner
           targetSocketId = room && room.owner;
           console.log(`Host target resolved: targetSocketId=${targetSocketId}`);
           // If owner is not connected, transfer ownership
           if (targetSocketId && !io.sockets.sockets.get(targetSocketId)) {
-            console.log(`Owner socket ${targetSocketId} not connected, transferring ownership`);
+            console.log(
+              `Owner socket ${targetSocketId} not connected, transferring ownership`,
+            );
             if (room.players.size > 0) {
               const firstPlayer = room.players.values().next().value;
-              if (firstPlayer && firstPlayer.socketId && io.sockets.sockets.get(firstPlayer.socketId)) {
+              if (
+                firstPlayer &&
+                firstPlayer.socketId &&
+                io.sockets.sockets.get(firstPlayer.socketId)
+              ) {
                 room.owner = firstPlayer.socketId;
                 targetSocketId = room.owner;
                 console.log(`Ownership transferred to ${targetSocketId}`);
@@ -4185,7 +4391,9 @@ io.on("connection", (socket) => {
       if (roomName) {
         const targetSock = io.sockets.sockets.get(targetSocketId);
         if (!targetSock || !targetSock.rooms.has(roomName)) {
-          console.log(`Sanity check failed: targetSock exists=${!!targetSock}, target in room=${targetSock?.rooms.has(roomName)}`);
+          console.log(
+            `Sanity check failed: targetSock exists=${!!targetSock}, target in room=${targetSock?.rooms.has(roomName)}`,
+          );
           return;
         }
       }
@@ -4313,13 +4521,15 @@ io.on("connection", (socket) => {
         // Check if producer exists on router
         try {
           const producers = consumerRouter.producers;
-          console.log(`[SFU] Router has ${producers.size} producers`);
-          const producerExists = Array.from(producers.keys()).includes(
-            effectiveProducerId,
-          );
-          console.log(
-            `[SFU] Producer ${effectiveProducerId} exists on router: ${producerExists}`,
-          );
+          if (producers && typeof producers.size === "number") {
+            console.log(`[SFU] Router has ${producers.size} producers`);
+            const producerExists = Array.from(producers.keys()).includes(
+              effectiveProducerId,
+            );
+            console.log(
+              `[SFU] Producer ${effectiveProducerId} exists on router: ${producerExists}`,
+            );
+          }
         } catch (e) {
           console.log(`[SFU] Error checking producers:`, e.message);
         }
@@ -4337,10 +4547,12 @@ io.on("connection", (socket) => {
           } else {
             // Try to get producer from router
             try {
-              const producer =
-                consumerRouter.producers.get(effectiveProducerId);
-              if (producer && producer.kind === "audio") {
-                isAudioConsumer = true;
+              const producers = consumerRouter.producers;
+              if (producers && typeof producers.get === "function") {
+                const producer = producers.get(effectiveProducerId);
+                if (producer && producer.kind === "audio") {
+                  isAudioConsumer = true;
+                }
               }
             } catch (e) {
               // Ignore errors, default to false
@@ -4353,6 +4565,13 @@ io.on("connection", (socket) => {
           rtpCapabilities,
           paused: false,
           ignoreDtx: isAudioConsumer, // Ignore DTX for audio consumers to prevent sync drift
+        });
+        console.log(`[SFU] sfu-consume: consumer created`, {
+          consumerId: consumer.id,
+          producerId: consumer.producerId,
+          kind: consumer.kind,
+          transportIceState: transportOwner.iceState,
+          transportDtlsState: transportOwner.dtlsState,
         });
         console.log(
           `[SFU] Successfully created consumer ${consumer.id} for producer ${effectiveProducerId}`,
@@ -4523,19 +4742,55 @@ io.on("connection", (socket) => {
       // ignore
     }
 
+    let usedGraceWindow = false;
+
     // Remove from any rooms and notify members.
     for (const [roomName, room] of rooms.entries()) {
       let wasOwner = room.owner === socket.id;
       let removedUserid = null;
+      let matchedExtra = null;
       for (const [uid, extra] of room.players.entries()) {
         if (
           (extra && extra.socketId === socket.id) ||
           (extra && extra.socket_id === socket.id)
         ) {
-          room.players.delete(uid);
           removedUserid = uid;
+          matchedExtra = extra;
           break;
         }
+      }
+
+      // Disconnect grace window: keep transports and room slot for reconnection
+      if (
+        removedUserid &&
+        matchedExtra &&
+        DISCONNECT_GRACE_SECONDS > 0 &&
+        peers.has(socket.id)
+      ) {
+        const p = peers.get(socket.id);
+        matchedExtra.disconnectedAt = Date.now();
+        disconnectedPeers.set(removedUserid, {
+          peer: p,
+          roomName,
+          timerId: setTimeout(() => {
+            cleanupDisconnectedPeer(removedUserid, false);
+          }, DISCONNECT_GRACE_SECONDS * 1000),
+          disconnectedAt: Date.now(),
+        });
+        const roomUsers = listRoomUsers(roomName);
+        io.to(roomName).emit("users-updated", roomUsers);
+        logger.debug("disconnect grace window started", {
+          socketId: socket.id,
+          userid: removedUserid,
+          roomName,
+          graceSeconds: DISCONNECT_GRACE_SECONDS,
+        });
+        usedGraceWindow = true;
+        continue;
+      }
+
+      if (removedUserid) {
+        room.players.delete(removedUserid);
       }
       if (wasOwner) {
         if (room.players.size > 0) {
@@ -4543,7 +4798,9 @@ io.on("connection", (socket) => {
           const firstPlayer = room.players.values().next().value;
           if (firstPlayer && firstPlayer.socketId) {
             room.owner = firstPlayer.socketId;
-            logger.debug(`Transferred ownership in room ${roomName} to ${room.owner}`);
+            logger.debug(
+              `Transferred ownership in room ${roomName} to ${room.owner}`,
+            );
           } else {
             // Fallback, delete room
             rooms.delete(roomName);
@@ -4599,18 +4856,23 @@ io.on("connection", (socket) => {
     }
 
     const p = peers.get(socket.id);
-    if (p) {
-      for (const transport of p.transports.values()) transport.close();
-      for (const producer of p.producers.values()) producer.close();
-      for (const consumer of p.consumers.values()) consumer.close();
-      if (p.dataProducers)
-        for (const dataProducer of p.dataProducers.values())
-          dataProducer.close();
-      if (p.dataConsumers)
-        for (const dataConsumer of p.dataConsumers.values())
-          dataConsumer.close();
-    }
     peers.delete(socket.id);
+
+    if (p && !usedGraceWindow) {
+      try {
+        for (const transport of p.transports.values()) transport.close();
+        for (const producer of p.producers.values()) producer.close();
+        for (const consumer of p.consumers.values()) consumer.close();
+        if (p.dataProducers)
+          for (const dataProducer of p.dataProducers.values())
+            dataProducer.close();
+        if (p.dataConsumers)
+          for (const dataConsumer of p.dataConsumers.values())
+            dataConsumer.close();
+      } catch (e) {
+        logger.warn("disconnect cleanup error", e);
+      }
+    }
   });
 });
 
@@ -4623,7 +4885,7 @@ function broadcastRoomList() {
       const currentPlayers = countActivePlayers(room);
       const isEmpty = currentPlayers === 0;
       const ageMinutes = (now - (room.created_at || 0)) / (1000 * 60);
-      
+
       // Filter out empty rooms that are older than grace period
       // Keep HTTP-created rooms for 30 seconds, WebSocket-created for 1 minute
       // This gives a brief grace period for reconnection but removes stale empty rooms quickly
@@ -4631,7 +4893,7 @@ function broadcastRoomList() {
       if (isEmpty && ageMinutes > keepMinutes) {
         return null; // Filter out old empty rooms
       }
-      
+
       return {
         id: roomName, // Use roomName as id
         name: roomName, // Use roomName as name
